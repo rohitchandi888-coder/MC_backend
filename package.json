@@ -1,0 +1,25 @@
+{
+  "name": "fda-wallet-backend",
+  "version": "1.0.0",
+  "main": "src/server.js",
+  "type": "module",
+  "scripts": {
+    "dev": "node src/server.js",
+    "init-db": "node src/initDb.js",
+    "reset-db": "node reset-database.js",
+    "create-admin": "node create-admin.js",
+    "backfill-transactions": "node backfill-trade-transactions.js",
+    "fix-duplicate-wallets": "node fix-duplicate-wallets.js",
+    "normalize-wallets": "node normalize-wallet-addresses.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.11.3"
+  }
+}
+
+
