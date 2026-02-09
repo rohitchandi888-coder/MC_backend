@@ -1561,6 +1561,121 @@ apiRouter.post('/internal/add-balance', authMiddleware, async (req, res) => {
   }
 });
 
+// Add FDA balance by FDA User ID - GET endpoint for testing (NO AUTH - REMOVE AFTER TESTING!)
+apiRouter.get('/admin/add-fda-balance', async (req, res) => {
+  try {
+    const { fdauserid, fda } = req.query;
+    const fda_user_id = fdauserid;
+    const fda_balance = fda;
+    
+    // Validate input
+    if (!fda_user_id) {
+      return res.status(400).json({ error: 'FDA user ID is required' });
+    }
+    
+    if (fda_balance === undefined || fda_balance === null || fda_balance === '') {
+      return res.status(400).json({ error: 'FDA balance is required' });
+    }
+    
+    const balanceNum = parseFloat(fda_balance);
+    if (isNaN(balanceNum)) {
+      return res.status(400).json({ error: 'FDA balance must be a valid number' });
+    }
+    
+    if (balanceNum <= 0) {
+      return res.status(400).json({ error: 'FDA balance must be greater than 0' });
+    }
+    
+    console.log(`\n[========================================]`);
+    console.log(`[ADMIN] 💰 Adding FDA balance for FDA User ID: ${fda_user_id}`);
+    console.log(`[ADMIN] Amount: ${balanceNum} FDA`);
+    console.log(`[========================================]\n`);
+    
+    // Find user by FDA user ID
+    const userRow = await db
+      .prepare('SELECT id, fda_user_id, email, phone FROM users WHERE fda_user_id = ?')
+      .get(fda_user_id);
+    
+    if (!userRow) {
+      console.log(`[ADMIN] ❌ User not found with FDA User ID: ${fda_user_id}`);
+      return res.status(404).json({ 
+        error: 'User not found',
+        message: `No user found with FDA User ID: ${fda_user_id}. Please ensure the user has logged in first.`
+      });
+    }
+    
+    const localUserId = userRow.id;
+    console.log(`[ADMIN] ✅ User found:`);
+    console.log(`  Local User ID: ${localUserId}`);
+    console.log(`  FDA User ID: ${userRow.fda_user_id}`);
+    console.log(`  Email: ${userRow.email || 'N/A'}`);
+    console.log(`  Phone: ${userRow.phone || 'N/A'}`);
+    
+    // Get or create balance record
+    let balanceRow = await db
+      .prepare('SELECT fda_balance FROM internal_balances WHERE user_id = ?')
+      .get(localUserId);
+    
+    const now = new Date().toISOString();
+    
+    if (!balanceRow) {
+      // Create new balance record
+      console.log(`[ADMIN] Creating new balance record for user ${localUserId}`);
+      const insertStmt = db.prepare('INSERT INTO internal_balances (user_id, fda_balance, updated_at) VALUES (?, ?, ?)');
+      await insertStmt.run(localUserId, balanceNum, now);
+      balanceRow = { fda_balance: balanceNum };
+    } else {
+      // Update existing balance
+      console.log(`[ADMIN] Updating existing balance: ${balanceRow.fda_balance} + ${balanceNum}`);
+      const updateStmt = db.prepare(
+        'UPDATE internal_balances SET fda_balance = fda_balance + ?, updated_at = ? WHERE user_id = ?'
+      );
+      const updateResult = await updateStmt.run(balanceNum, now, localUserId);
+      
+      if (updateResult.changes === 0) {
+        console.error(`[ADMIN] ❌ Failed to update balance. No rows affected.`);
+        return res.status(500).json({ error: 'Failed to update balance. No rows affected.' });
+      }
+      
+      // Get updated balance
+      balanceRow = await db
+        .prepare('SELECT fda_balance FROM internal_balances WHERE user_id = ?')
+        .get(localUserId);
+    }
+    
+    const newBalance = balanceRow ? parseFloat(balanceRow.fda_balance) : balanceNum;
+    
+    console.log(`[ADMIN] ✅ Balance added successfully:`);
+    console.log(`  Previous Balance: ${(newBalance - balanceNum).toFixed(8)} FDA`);
+    console.log(`  Amount Added: ${balanceNum.toFixed(8)} FDA`);
+    console.log(`  New Balance: ${newBalance.toFixed(8)} FDA`);
+    console.log(`[========================================]\n`);
+    
+    res.json({ 
+      success: true,
+      message: `Successfully added ${balanceNum} FDA to user's balance`,
+      user: {
+        localUserId: localUserId,
+        fdaUserId: userRow.fda_user_id,
+        email: userRow.email,
+        phone: userRow.phone
+      },
+      balance: {
+        amountAdded: balanceNum,
+        previousBalance: (newBalance - balanceNum),
+        newBalance: newBalance
+      }
+    });
+  } catch (err) {
+    console.error('[ADMIN] ❌ Error adding FDA balance:', err);
+    console.error('Error stack:', err.stack);
+    res.status(500).json({ 
+      error: 'Failed to add FDA balance',
+      details: err.message || 'Database error'
+    });
+  }
+});
+
 apiRouter.get('/internal/user-by-address', authMiddleware, async (req, res) => {
   const { address } = req.query;
   if (!address) {
