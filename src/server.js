@@ -14,6 +14,12 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
+// Create API router to mount all routes under /api prefix
+const apiRouter = express.Router();
+
+// Mount API router at /api - all routes will be accessible at /api/*
+app.use('/api', apiRouter);
+
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error('Express error:', err);
@@ -258,7 +264,8 @@ async function updateFDABalanceOnRemote(userId, amount) {
 }
 
 // Auth - Remote Login with Auto-Register (Only calls remote API if user doesn't exist)
-app.post('/auth/login', async (req, res) => {
+// Auth - Remote Login with Auto-Register (Only calls remote API if user doesn't exist)
+apiRouter.post('/auth/login', async (req, res) => {
   const { username, password } = req.body;
   
   if (!username || !password) {
@@ -536,7 +543,7 @@ app.post('/auth/login', async (req, res) => {
 });
 
 // Forgot Password
-app.post('/auth/forgot-password', async (req, res) => {
+apiRouter.post('/auth/forgot-password', async (req, res) => {
   const { email } = req.body;
   if (!email) {
     return res.status(400).json({ error: 'Email is required' });
@@ -574,7 +581,7 @@ app.post('/auth/forgot-password', async (req, res) => {
 });
 
 // Reset Password
-app.post('/auth/reset-password', async (req, res) => {
+apiRouter.post('/auth/reset-password', async (req, res) => {
   const { token, password } = req.body;
   
   if (!token) {
@@ -608,7 +615,7 @@ app.post('/auth/reset-password', async (req, res) => {
 });
 
 // Get Profile
-app.get('/auth/profile', authMiddleware, async (req, res) => {
+apiRouter.get('/auth/profile', authMiddleware, async (req, res) => {
   try {
     const row = await db
       .prepare('SELECT id, fda_user_id, email, phone, full_name, is_admin, created_at FROM users WHERE id = ?')
@@ -633,7 +640,7 @@ app.get('/auth/profile', authMiddleware, async (req, res) => {
 });
 
 // Update Profile
-app.put('/auth/profile', authMiddleware, async (req, res) => {
+apiRouter.put('/auth/profile', authMiddleware, async (req, res) => {
   const { full_name, email, phone } = req.body;
 
   if (!email && !phone) {
@@ -686,7 +693,7 @@ app.put('/auth/profile', authMiddleware, async (req, res) => {
 });
 
 // Change Password
-app.put('/auth/change-password', authMiddleware, async (req, res) => {
+apiRouter.put('/auth/change-password', authMiddleware, async (req, res) => {
   const { current_password, new_password } = req.body;
 
   if (!current_password || !new_password) {
@@ -724,7 +731,7 @@ app.put('/auth/change-password', authMiddleware, async (req, res) => {
 });
 
 // Offers
-app.get('/offers', authMiddleware, async (req, res) => {
+apiRouter.get('/offers', authMiddleware, async (req, res) => {
   const rows = await db
     .prepare(
       `SELECT o.*, u.email as maker_email, u.phone as maker_phone
@@ -757,7 +764,7 @@ app.get('/offers', authMiddleware, async (req, res) => {
   );
 });
 
-app.post('/offers', authMiddleware, async (req, res) => {
+apiRouter.post('/offers', authMiddleware, async (req, res) => {
   const {
     type,
     assetSymbol,
@@ -899,7 +906,7 @@ app.post('/offers', authMiddleware, async (req, res) => {
 });
 
 // Trades
-app.get('/trades', authMiddleware, async (req, res) => {
+apiRouter.get('/trades', authMiddleware, async (req, res) => {
   const rows = await db
     .prepare(
       `SELECT t.*, 
@@ -916,7 +923,7 @@ app.get('/trades', authMiddleware, async (req, res) => {
   res.json(rows);
 });
 
-app.post('/trades', authMiddleware, async (req, res) => {
+apiRouter.post('/trades', authMiddleware, async (req, res) => {
   const { offerId, amount } = req.body;
   
   console.log('\n[========================================]');
@@ -1096,7 +1103,7 @@ app.post('/trades', authMiddleware, async (req, res) => {
   }
 });
 
-app.post('/trades/:id/mark-paid', authMiddleware, async (req, res) => {
+apiRouter.post('/trades/:id/mark-paid', authMiddleware, async (req, res) => {
   const { id } = req.params;
   const { payment_screenshot } = req.body; // Base64 image or URL
   
@@ -1134,7 +1141,7 @@ app.post('/trades/:id/mark-paid', authMiddleware, async (req, res) => {
   }
 });
 
-app.post('/trades/:id/release', authMiddleware, async (req, res) => {
+apiRouter.post('/trades/:id/release', authMiddleware, async (req, res) => {
   try {
     const tradeId = parseInt(req.params.id, 10);
     if (isNaN(tradeId)) {
@@ -1209,7 +1216,7 @@ app.post('/trades/:id/release', authMiddleware, async (req, res) => {
 });
 
 // Cancel trade
-app.post('/trades/:id/cancel', authMiddleware, async (req, res) => {
+apiRouter.post('/trades/:id/cancel', authMiddleware, async (req, res) => {
   const { id } = req.params;
   const trade = await db.prepare('SELECT * FROM trades WHERE id = ?').get(id);
   
@@ -1252,7 +1259,7 @@ app.post('/trades/:id/cancel', authMiddleware, async (req, res) => {
 });
 
 // Cancel offer
-app.post('/offers/:id/cancel', authMiddleware, async (req, res) => {
+apiRouter.post('/offers/:id/cancel', authMiddleware, async (req, res) => {
   const { id } = req.params;
   const offer = await db.prepare('SELECT * FROM offers WHERE id = ?').get(id);
   
@@ -1304,7 +1311,7 @@ app.post('/offers/:id/cancel', authMiddleware, async (req, res) => {
 });
 
 // Disputes
-app.post('/trades/:id/disputes', authMiddleware, async (req, res) => {
+apiRouter.post('/trades/:id/disputes', authMiddleware, async (req, res) => {
   const { id } = req.params;
   const { reason } = req.body;
   if (!reason) {
@@ -1375,14 +1382,14 @@ app.post('/trades/:id/disputes', authMiddleware, async (req, res) => {
 });
 
 // Wallet registration (link wallet address to user)
-app.get('/wallets', authMiddleware, async (req, res) => {
+apiRouter.get('/wallets', authMiddleware, async (req, res) => {
   const wallets = await db
     .prepare('SELECT id, address, label, created_at FROM wallets WHERE user_id = ? ORDER BY created_at DESC')
     .all(req.user.id);
   res.json(wallets);
 });
 
-app.post('/wallets/register', authMiddleware, async (req, res) => {
+apiRouter.post('/wallets/register', authMiddleware, async (req, res) => {
   const { address, label } = req.body;
   if (!address) {
     return res.status(400).json({ error: 'Wallet address is required' });
@@ -1441,7 +1448,7 @@ app.post('/wallets/register', authMiddleware, async (req, res) => {
 });
 
 // Internal FDA Transfers (Zero Fee)
-app.get('/internal/balance', authMiddleware, async (req, res) => {
+apiRouter.get('/internal/balance', authMiddleware, async (req, res) => {
   const balanceRow = await db
     .prepare('SELECT fda_balance FROM internal_balances WHERE user_id = ?')
     .get(req.user.id);
@@ -1491,7 +1498,7 @@ app.get('/internal/balance', authMiddleware, async (req, res) => {
 });
 
 // Add FDA tokens to internal balance (for testing/deposits)
-app.post('/internal/add-balance', authMiddleware, async (req, res) => {
+apiRouter.post('/internal/add-balance', authMiddleware, async (req, res) => {
   try {
     console.log('Add balance request:', { userId: req.user.id, body: req.body });
     const { amount } = req.body;
@@ -1554,7 +1561,7 @@ app.post('/internal/add-balance', authMiddleware, async (req, res) => {
   }
 });
 
-app.get('/internal/user-by-address', authMiddleware, async (req, res) => {
+apiRouter.get('/internal/user-by-address', authMiddleware, async (req, res) => {
   const { address } = req.query;
   if (!address) {
     return res.status(400).json({ error: 'Address is required' });
@@ -1592,7 +1599,7 @@ app.get('/internal/user-by-address', authMiddleware, async (req, res) => {
   }
 });
 
-app.post('/internal/transfer', authMiddleware, async (req, res) => {
+apiRouter.post('/internal/transfer', authMiddleware, async (req, res) => {
   const { toAddress, amount, note } = req.body;
   
   if (!toAddress) {
@@ -1699,7 +1706,7 @@ app.post('/internal/transfer', authMiddleware, async (req, res) => {
   }
 });
 
-app.get('/internal/transfers', authMiddleware, async (req, res) => {
+apiRouter.get('/internal/transfers', authMiddleware, async (req, res) => {
   try {
     const rows = await db
       .prepare(
@@ -1752,24 +1759,24 @@ app.get('/internal/transfers', authMiddleware, async (req, res) => {
 });
 
 // Settings endpoints
-app.get('/admin/settings', authMiddleware, adminMiddleware, async (_req, res) => {
+apiRouter.get('/admin/settings', authMiddleware, adminMiddleware, async (_req, res) => {
   const settings = await db.prepare('SELECT * FROM settings ORDER BY key').all();
   res.json(settings);
 });
 
-app.get('/settings/p2p-fee-rate', async (_req, res) => {
+apiRouter.get('/settings/p2p-fee-rate', async (_req, res) => {
   const setting = await db.prepare('SELECT value FROM settings WHERE key = ?').get('p2p_fee_rate');
   const feeRate = setting ? parseFloat(setting.value) : 0;
   res.json({ feeRate, feeRatePercent: feeRate });
 });
 
-app.get('/settings/holding-fda-amount', async (_req, res) => {
+apiRouter.get('/settings/holding-fda-amount', async (_req, res) => {
   const setting = await db.prepare('SELECT value FROM settings WHERE key = ?').get('holding_fda_amount');
   const holdingAmount = setting ? parseFloat(setting.value) : 0;
   res.json({ holdingAmount });
 });
 
-app.put('/admin/settings/:key', authMiddleware, adminMiddleware, async (req, res) => {
+apiRouter.put('/admin/settings/:key', authMiddleware, adminMiddleware, async (req, res) => {
   const { key } = req.params;
   let { value, description } = req.body;
   
@@ -1837,7 +1844,7 @@ app.put('/admin/settings/:key', authMiddleware, adminMiddleware, async (req, res
 });
 
 // Admin user management
-app.post('/admin/promote-user', authMiddleware, adminMiddleware, async (req, res) => {
+apiRouter.post('/admin/promote-user', authMiddleware, adminMiddleware, async (req, res) => {
   const { userId } = req.body;
   if (!userId) {
     return res.status(400).json({ error: 'User ID is required' });
@@ -1858,7 +1865,7 @@ app.post('/admin/promote-user', authMiddleware, adminMiddleware, async (req, res
   }
 });
 
-app.get('/admin/users', authMiddleware, adminMiddleware, async (_req, res) => {
+apiRouter.get('/admin/users', authMiddleware, adminMiddleware, async (_req, res) => {
   const users = await db.prepare('SELECT id, fda_user_id, email, phone, full_name, is_admin, created_at FROM users ORDER BY created_at DESC').all();
   res.json(users.map(u => ({ 
     ...u, 
@@ -1868,7 +1875,7 @@ app.get('/admin/users', authMiddleware, adminMiddleware, async (_req, res) => {
 });
 
 // Update admin user (demote or update details)
-app.put('/admin/users/:userId', authMiddleware, adminMiddleware, async (req, res) => {
+apiRouter.put('/admin/users/:userId', authMiddleware, adminMiddleware, async (req, res) => {
   const { userId } = req.params;
   const { isAdmin, email, phone, fullName, password } = req.body;
 
@@ -1913,7 +1920,7 @@ app.put('/admin/users/:userId', authMiddleware, adminMiddleware, async (req, res
 });
 
 // Admin endpoint to update FDA balance on remote FDA server (only if user exists in MC Wallet)
-app.post('/admin/update-fda-balance', authMiddleware, adminMiddleware, async (req, res) => {
+apiRouter.post('/admin/update-fda-balance', authMiddleware, adminMiddleware, async (req, res) => {
   const { userId, amount } = req.body;
 
   // Validate input
@@ -2005,7 +2012,7 @@ app.post('/admin/update-fda-balance', authMiddleware, adminMiddleware, async (re
 
 // Public API endpoint for futuredigiassets.com to send FDA to MC wallet
 // This endpoint is protected by API key and origin validation
-app.post('/api/fda/transfer-to-mc-wallet', validateFDAOrigin, validateAPIKey, async (req, res) => {
+apiRouter.post('/fda/transfer-to-mc-wallet', validateFDAOrigin, validateAPIKey, async (req, res) => {
   const { userId, amount, holdingPeriod } = req.body;
 
   // Validate input
@@ -2166,7 +2173,7 @@ app.post('/api/fda/transfer-to-mc-wallet', validateFDAOrigin, validateAPIKey, as
 });
 
 // Admin monitoring (read-only)
-app.get('/admin/trades', authMiddleware, adminMiddleware, async (_req, res) => {
+apiRouter.get('/admin/trades', authMiddleware, adminMiddleware, async (_req, res) => {
   const rows = await db
     .prepare(
       `SELECT t.*, 
@@ -2183,7 +2190,7 @@ app.get('/admin/trades', authMiddleware, adminMiddleware, async (_req, res) => {
 });
 
 // Admin: Get all holdings
-app.get('/admin/holdings', authMiddleware, adminMiddleware, async (_req, res) => {
+apiRouter.get('/admin/holdings', authMiddleware, adminMiddleware, async (_req, res) => {
   try {
     const holdings = await db
       .prepare(`
@@ -2218,7 +2225,7 @@ app.get('/admin/holdings', authMiddleware, adminMiddleware, async (_req, res) =>
 });
 
 // Admin: Update holding period
-app.put('/admin/holdings/:id', authMiddleware, adminMiddleware, async (req, res) => {
+apiRouter.put('/admin/holdings/:id', authMiddleware, adminMiddleware, async (req, res) => {
   const { id } = req.params;
   const { holdingPeriod } = req.body;
 
@@ -2310,7 +2317,7 @@ app.put('/admin/holdings/:id', authMiddleware, adminMiddleware, async (req, res)
   }
 });
 
-app.get('/admin/disputes', authMiddleware, adminMiddleware, async (_req, res) => {
+apiRouter.get('/admin/disputes', authMiddleware, adminMiddleware, async (_req, res) => {
   try {
     const result = await db.query(
       `SELECT d.*, 
@@ -2337,7 +2344,7 @@ app.get('/admin/disputes', authMiddleware, adminMiddleware, async (_req, res) =>
 });
 
 // Admin resolve dispute
-app.post('/admin/disputes/:id/resolve', authMiddleware, adminMiddleware, async (req, res) => {
+apiRouter.post('/admin/disputes/:id/resolve', authMiddleware, adminMiddleware, async (req, res) => {
   const { id } = req.params;
   const { status, resolution_note, trade_action } = req.body; // trade_action: 'release', 'cancel', 'none'
   
