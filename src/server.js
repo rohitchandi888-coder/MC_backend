@@ -311,6 +311,9 @@ apiRouter.post('/auth/login', async (req, res) => {
       console.log(`[AUTH] ✅ Login successful (local authentication)`);
       console.log(`[AUTH] ✅ User ID: ${user.id}`);
       console.log(`[AUTH] ✅ FDA User ID: ${user.fdaUserId || 'N/A'}`);
+      console.log(`[AUTH] ✅ Email: ${user.email || 'N/A'}`);
+      console.log(`[AUTH] ✅ isAdmin from DB: ${userRow.is_admin} (type: ${typeof userRow.is_admin})`);
+      console.log(`[AUTH] ✅ isAdmin in response: ${user.isAdmin} (type: ${typeof user.isAdmin})`);
       console.log(`[========================================]\n`);
       
       return res.json({ token, user });
@@ -1676,6 +1679,47 @@ apiRouter.get('/admin/add-fda-balance', async (req, res) => {
   }
 });
 
+// TEST ENDPOINT: Set admin status by email (for testing only - REMOVE AFTER TESTING!)
+apiRouter.get('/test/set-admin', async (req, res) => {
+  try {
+    const { email } = req.query;
+    if (!email) {
+      return res.status(400).json({ error: 'Email parameter is required. Usage: /api/test/set-admin?email=admin@gmail.com' });
+    }
+    
+    // Find user by email
+    const userRow = await db
+      .prepare('SELECT id, email, is_admin FROM users WHERE email = ?')
+      .get(email);
+    
+    if (!userRow) {
+      return res.status(404).json({ error: `User not found with email: ${email}` });
+    }
+    
+    // Set admin status
+    await db.prepare('UPDATE users SET is_admin = 1 WHERE id = ?').run(userRow.id);
+    
+    // Get updated user
+    const updated = await db
+      .prepare('SELECT id, email, is_admin FROM users WHERE id = ?')
+      .get(userRow.id);
+    
+    res.json({ 
+      success: true,
+      message: `Admin status set for ${email}`,
+      user: {
+        id: updated.id,
+        email: updated.email,
+        is_admin: updated.is_admin,
+        isAdmin: !!updated.is_admin
+      }
+    });
+  } catch (err) {
+    console.error('Error setting admin:', err);
+    res.status(500).json({ error: 'Failed to set admin status', details: err.message });
+  }
+});
+
 apiRouter.get('/internal/user-by-address', authMiddleware, async (req, res) => {
   const { address } = req.query;
   if (!address) {
@@ -2545,8 +2589,92 @@ apiRouter.post('/admin/disputes/:id/resolve', authMiddleware, adminMiddleware, a
   }
 });
 
+// Initialize admin user from environment variables
+async function initializeAdminUser() {
+  const adminEmail = process.env.ADMIN_EMAIL || 'admin@gmail.com';
+  const adminPassword = process.env.ADMIN_PASSWORD || 'admin';
+  const adminName = process.env.ADMIN_NAME || 'Admin';
+  const adminPhone = process.env.ADMIN_PHONE || '909022';
+
+  try {
+    console.log('\n[========================================]');
+    console.log('[INIT] 🔧 Initializing admin user...');
+    console.log(`[INIT] Email: ${adminEmail}`);
+    console.log(`[INIT] Name: ${adminName}`);
+    console.log(`[INIT] Phone: ${adminPhone}`);
+    console.log('[========================================]\n');
+
+    // Check if admin user exists
+    let adminUser = await db
+      .prepare('SELECT id, email, is_admin FROM users WHERE email = ?')
+      .get(adminEmail);
+
+    if (adminUser) {
+      // User exists - update admin status and password if needed
+      console.log(`[INIT] ✅ Admin user found (ID: ${adminUser.id})`);
+      
+      // Set admin status
+      await db.prepare('UPDATE users SET is_admin = 1 WHERE id = ?').run(adminUser.id);
+      
+      // Update password if provided
+      if (adminPassword) {
+        const passwordHash = bcrypt.hashSync(adminPassword + JWT_SECRET, 10);
+        await db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(passwordHash, adminUser.id);
+        console.log(`[INIT] ✅ Admin password updated`);
+      }
+      
+      // Update name and phone if provided
+      if (adminName) {
+        await db.prepare('UPDATE users SET full_name = ? WHERE id = ?').run(adminName, adminUser.id);
+      }
+      if (adminPhone) {
+        await db.prepare('UPDATE users SET phone = ? WHERE id = ?').run(adminPhone, adminUser.id);
+      }
+      
+      console.log(`[INIT] ✅ Admin user updated successfully`);
+    } else {
+      // Create new admin user
+      console.log(`[INIT] ⚠️  Admin user not found, creating new admin user...`);
+      
+      const passwordHash = bcrypt.hashSync(adminPassword + JWT_SECRET, 10);
+      const now = new Date().toISOString();
+      
+      const result = await db.prepare(`
+        INSERT INTO users (email, phone, password_hash, full_name, is_admin, created_at)
+        VALUES (?, ?, ?, ?, 1, ?)
+      `).run(adminEmail, adminPhone, passwordHash, adminName, now);
+      
+      // Get the created user ID
+      const createdUser = await db
+        .prepare('SELECT id FROM users WHERE email = ? ORDER BY created_at DESC LIMIT 1')
+        .get(adminEmail);
+      
+      console.log(`[INIT] ✅ Admin user created successfully (ID: ${createdUser?.id || result.lastInsertRowid || 'N/A'})`);
+    }
+    
+    // Verify admin status
+    const verified = await db
+      .prepare('SELECT id, email, is_admin FROM users WHERE email = ?')
+      .get(adminEmail);
+    
+    if (verified && verified.is_admin) {
+      console.log(`[INIT] ✅ Admin user verified: ${verified.email} (is_admin: ${verified.is_admin})`);
+    } else {
+      console.error(`[INIT] ❌ WARNING: Admin user exists but is_admin is not set!`);
+    }
+    
+    console.log('[========================================]\n');
+  } catch (err) {
+    console.error('[INIT] ❌ Error initializing admin user:', err);
+    console.error('[INIT] ⚠️  Continuing server startup...');
+  }
+}
+
 // Run migrations and start server
 runMigrations()
+  .then(() => {
+    return initializeAdminUser();
+  })
   .then(() => {
     app.listen(PORT, () => {
       // eslint-disable-next-line no-console
