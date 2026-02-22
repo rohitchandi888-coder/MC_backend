@@ -277,18 +277,36 @@ apiRouter.post('/auth/login', async (req, res) => {
     console.log(`[AUTH] 🔐 Attempting login for user: ${username}`);
     console.log(`[========================================]\n`);
     
-    // Step 1: First check if user exists locally (by username, email, or phone)
-    // Prioritize email/phone matches over fda_user_id to avoid finding wrong user
-    // Try email/phone first, then fda_user_id
+    // Step 1: First check if user exists locally (by username, email, phone, or fda_user_id)
+    // Try all possible matches to find the user
+    console.log(`[AUTH] 🔍 Searching for user with identifier: ${username}`);
+    console.log(`[AUTH] 🔍 Checking email, phone, and fda_user_id...`);
+    
+    // Try email/phone first
     let userRow = await db
       .prepare('SELECT id, fda_user_id, email, phone, password_hash, is_admin FROM users WHERE email = ? OR phone = ?')
       .get(username, username);
     
-    // If not found by email/phone, try fda_user_id
+    // If not found by email/phone, try fda_user_id (as string)
     if (!userRow) {
+      console.log(`[AUTH] 🔍 Not found by email/phone, trying fda_user_id...`);
       userRow = await db
         .prepare('SELECT id, fda_user_id, email, phone, password_hash, is_admin FROM users WHERE fda_user_id = ?')
-        .get(username);
+        .get(String(username));
+    }
+    
+    // Also try if username is numeric and matches the database id (for testing)
+    if (!userRow && /^\d+$/.test(username)) {
+      console.log(`[AUTH] 🔍 Username is numeric, checking if it matches database ID...`);
+      const numericId = parseInt(username, 10);
+      if (!isNaN(numericId)) {
+        userRow = await db
+          .prepare('SELECT id, fda_user_id, email, phone, password_hash, is_admin FROM users WHERE id = ?')
+          .get(numericId);
+        if (userRow) {
+          console.log(`[AUTH] ⚠️  Found user by database ID (this should not be used for login, but found for debugging)`);
+        }
+      }
     }
     
     console.log(`[AUTH] 🔍 User lookup result:`, userRow ? { id: userRow.id, email: userRow.email, phone: userRow.phone, is_admin: userRow.is_admin } : 'Not found');
@@ -296,12 +314,52 @@ apiRouter.post('/auth/login', async (req, res) => {
     // Step 2: If user exists locally, authenticate with local password
     if (userRow) {
       console.log(`[AUTH] ✅ User found locally with ID: ${userRow.id}, FDA User ID: ${userRow.fda_user_id}`);
+      console.log(`[AUTH] 🔍 Checking password for user: ${username}`);
+      console.log(`[AUTH] 🔍 Password hash exists: ${!!userRow.password_hash}`);
+      console.log(`[AUTH] 🔍 Password hash length: ${userRow.password_hash?.length || 0}`);
       
       // Verify password against stored hash
-      const valid = bcrypt.compareSync(password + JWT_SECRET, userRow.password_hash);
+      const passwordToCheck = password + JWT_SECRET;
+      console.log(`[AUTH] 🔍 Attempting password verification...`);
+      const valid = bcrypt.compareSync(passwordToCheck, userRow.password_hash);
+      
       if (!valid) {
-        console.log(`[AUTH] ❌ Invalid password for local user`);
-        return res.status(401).json({ error: 'Invalid credentials. Please check your user ID and password.' });
+        console.log(`[AUTH] ❌ Invalid password for local user ${username}`);
+        console.log(`[AUTH] 🔍 User exists but password doesn't match`);
+        console.log(`[AUTH] 🔍 This could mean:`);
+        console.log(`[AUTH] 🔍   1. Password is incorrect`);
+        console.log(`[AUTH] 🔍   2. Password was changed on FDA but not synced locally`);
+        console.log(`[AUTH] 🔍   3. User should authenticate via FDA API`);
+        console.log(`[AUTH] 🔍 Attempting FDA API authentication as fallback...`);
+        
+        // If local password fails, try FDA API as fallback
+        const fdaResponse = await getUserFromFDA(username, password);
+        console.log(`[FDA API] 📥 Fallback FDA response status:`, fdaResponse.status);
+        
+        if (fdaResponse.status) {
+          console.log(`[AUTH] ✅ FDA API authentication successful, updating local password...`);
+          // Update local password hash to match FDA
+          const newPasswordHash = bcrypt.hashSync(password + JWT_SECRET, 10);
+          await db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(newPasswordHash, userRow.id);
+          console.log(`[AUTH] ✅ Local password updated successfully`);
+          
+          // Generate JWT token and return user data
+          const user = toUserDto(userRow);
+          const token = jwt.sign({ sub: user.id }, JWT_SECRET, { expiresIn: '7d' });
+          
+          console.log(`[AUTH] ✅ Login successful (FDA fallback authentication)`);
+          console.log(`[AUTH] ✅ User ID: ${user.id}`);
+          console.log(`[AUTH] ✅ FDA User ID: ${user.fdaUserId || 'N/A'}`);
+          console.log(`[AUTH] ✅ Email: ${user.email || 'N/A'}`);
+          console.log(`[AUTH] ✅ isAdmin from DB: ${userRow.is_admin} (type: ${typeof userRow.is_admin})`);
+          console.log(`[AUTH] ✅ isAdmin in response: ${user.isAdmin} (type: ${typeof user.isAdmin})`);
+          console.log(`[========================================]\n`);
+          
+          return res.json({ token, user, fdaUserData: fdaResponse.data });
+        } else {
+          console.log(`[AUTH] ❌ Both local and FDA authentication failed`);
+          return res.status(401).json({ error: 'Invalid credentials. Please check your user ID and password.' });
+        }
       }
       
       // Generate JWT token and return user data
@@ -1386,10 +1444,16 @@ apiRouter.post('/trades/:id/disputes', authMiddleware, async (req, res) => {
 
 // Wallet registration (link wallet address to user)
 apiRouter.get('/wallets', authMiddleware, async (req, res) => {
-  const wallets = await db
-    .prepare('SELECT id, address, label, created_at FROM wallets WHERE user_id = ? ORDER BY created_at DESC')
-    .all(req.user.id);
-  res.json(wallets);
+  try {
+    const result = await db.query(
+      'SELECT id, address, label, created_at FROM wallets WHERE user_id = $1 ORDER BY created_at DESC',
+      [req.user.id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('[GET /wallets] Error:', err);
+    res.status(500).json({ error: `Failed to get wallets: ${err.message || 'Unknown error'}` });
+  }
 });
 
 apiRouter.post('/wallets/register', authMiddleware, async (req, res) => {
@@ -1447,6 +1511,282 @@ apiRouter.post('/wallets/register', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Wallet address already registered to another user' });
     }
     res.status(500).json({ error: `Failed to register wallet: ${err.message || 'Unknown error'}` });
+  }
+});
+
+// Save encrypted wallet phrase (12 words + 13th word)
+apiRouter.post('/wallets/save-phrase', authMiddleware, async (req, res) => {
+  const { walletAddress, encryptedPhrase, network, label } = req.body;
+  
+  if (!walletAddress || !encryptedPhrase) {
+    return res.status(400).json({ error: 'Wallet address and encrypted phrase are required' });
+  }
+  
+  try {
+    console.log(`[POST /wallets/save-phrase] User ID: ${req.user.id}, Address: ${walletAddress}`);
+    
+    // Ensure table exists
+    const tableCheck = await db.query(`
+      SELECT EXISTS (
+        SELECT FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_name = 'wallet_phrases'
+      );
+    `);
+    
+    if (!tableCheck.rows[0]?.exists) {
+      console.error('[POST /wallets/save-phrase] Table wallet_phrases does not exist. Creating table...');
+      // Try to create the table if it doesn't exist
+      try {
+        await db.query(`
+          CREATE TABLE IF NOT EXISTS wallet_phrases (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            wallet_address VARCHAR(255) NOT NULL,
+            encrypted_phrase TEXT NOT NULL,
+            network VARCHAR(50),
+            label VARCHAR(255),
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            UNIQUE(user_id, wallet_address)
+          );
+        `);
+        console.log('[POST /wallets/save-phrase] ✅ Table wallet_phrases created successfully');
+      } catch (createErr) {
+        console.error('[POST /wallets/save-phrase] Failed to create table:', createErr);
+        return res.status(500).json({ 
+          error: 'Database table wallet_phrases does not exist and could not be created. Please check database permissions.' 
+        });
+      }
+    }
+    
+    const encryptedPhraseStr = typeof encryptedPhrase === 'string' 
+      ? encryptedPhrase 
+      : JSON.stringify(encryptedPhrase);
+    
+    const result = await db.query(
+      `INSERT INTO wallet_phrases (user_id, wallet_address, encrypted_phrase, network, label)
+       VALUES ($1, LOWER($2), $3, $4, $5)
+       ON CONFLICT (user_id, wallet_address) 
+       DO UPDATE SET encrypted_phrase = $3, network = $4, label = $5, created_at = CURRENT_TIMESTAMP
+       RETURNING id, wallet_address, network, label, created_at`,
+      [req.user.id, walletAddress, encryptedPhraseStr, network || null, label || null]
+    );
+    
+    console.log(`[POST /wallets/save-phrase] Successfully saved phrase for wallet ${walletAddress}`);
+    res.json({ success: true, phrase: result.rows[0] });
+  } catch (err) {
+    console.error('[POST /wallets/save-phrase] Error:', err);
+    console.error('[POST /wallets/save-phrase] Error stack:', err.stack);
+    res.status(500).json({ error: `Failed to save phrase: ${err.message || 'Unknown error'}` });
+  }
+});
+
+// Get all encrypted phrases for the authenticated user
+apiRouter.get('/wallets/phrases', authMiddleware, async (req, res) => {
+  try {
+    console.log(`[GET /wallets/phrases] User ID: ${req.user.id}`);
+    
+    // Check if table exists first
+    const tableCheck = await db.query(`
+      SELECT EXISTS (
+        SELECT FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_name = 'wallet_phrases'
+      );
+    `);
+    
+    if (!tableCheck.rows[0]?.exists) {
+      console.error('[GET /wallets/phrases] Table wallet_phrases does not exist. Creating table...');
+      // Try to create the table if it doesn't exist
+      try {
+        await db.query(`
+          CREATE TABLE IF NOT EXISTS wallet_phrases (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            wallet_address VARCHAR(255) NOT NULL,
+            encrypted_phrase TEXT NOT NULL,
+            network VARCHAR(50),
+            label VARCHAR(255),
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            UNIQUE(user_id, wallet_address)
+          );
+        `);
+        console.log('[GET /wallets/phrases] ✅ Table wallet_phrases created successfully');
+        return res.json({ success: true, phrases: [] }); // Return empty array after creating table
+      } catch (createErr) {
+        console.error('[GET /wallets/phrases] Failed to create table:', createErr);
+        return res.json({ success: true, phrases: [] }); // Return empty array if creation fails
+      }
+    }
+    
+    const result = await db.query(
+      `SELECT id, wallet_address, encrypted_phrase, network, label, created_at
+       FROM wallet_phrases
+       WHERE user_id = $1
+       ORDER BY created_at DESC`,
+      [req.user.id]
+    );
+    
+    console.log(`[GET /wallets/phrases] Found ${result.rows.length} phrases for user ${req.user.id}`);
+    
+    const phrases = result.rows.map(row => {
+      try {
+        return {
+          id: row.id,
+          walletAddress: row.wallet_address,
+          encryptedPhrase: typeof row.encrypted_phrase === 'string' 
+            ? JSON.parse(row.encrypted_phrase) 
+            : row.encrypted_phrase,
+          network: row.network,
+          label: row.label,
+          createdAt: row.created_at,
+        };
+      } catch (parseErr) {
+        console.error(`[GET /wallets/phrases] Error parsing phrase ${row.id}:`, parseErr);
+        return null;
+      }
+    }).filter(p => p !== null);
+    
+    res.json({ success: true, phrases });
+  } catch (err) {
+    console.error('[GET /wallets/phrases] Error:', err);
+    console.error('[GET /wallets/phrases] Error stack:', err.stack);
+    res.status(500).json({ error: `Failed to get phrases: ${err.message || 'Unknown error'}` });
+  }
+});
+
+// Payment Methods API
+apiRouter.get('/payment-methods', authMiddleware, async (req, res) => {
+  try {
+    const result = await db.query(
+      'SELECT id, upi_id, qr_code, is_active, created_at, updated_at FROM payment_methods WHERE user_id = $1 ORDER BY created_at DESC',
+      [req.user.id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('[GET /payment-methods] Error:', err);
+    res.status(500).json({ error: `Failed to get payment methods: ${err.message || 'Unknown error'}` });
+  }
+});
+
+apiRouter.post('/payment-methods', authMiddleware, async (req, res) => {
+  const { upi_id, qr_code } = req.body;
+  
+  if (!upi_id || !upi_id.trim()) {
+    return res.status(400).json({ error: 'UPI ID is required' });
+  }
+  
+  try {
+    const result = await db.query(
+      `INSERT INTO payment_methods (user_id, upi_id, qr_code, is_active)
+       VALUES ($1, $2, $3, true)
+       RETURNING id, upi_id, qr_code, is_active, created_at, updated_at`,
+      [req.user.id, upi_id.trim(), qr_code?.trim() || null]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('[POST /payment-methods] Error:', err);
+    res.status(500).json({ error: `Failed to create payment method: ${err.message || 'Unknown error'}` });
+  }
+});
+
+apiRouter.put('/payment-methods/:id', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const { upi_id, qr_code } = req.body;
+  
+  if (!upi_id || !upi_id.trim()) {
+    return res.status(400).json({ error: 'UPI ID is required' });
+  }
+  
+  try {
+    // Verify the payment method belongs to the user
+    const check = await db.query(
+      'SELECT id FROM payment_methods WHERE id = $1 AND user_id = $2',
+      [id, req.user.id]
+    );
+    
+    if (check.rows.length === 0) {
+      return res.status(404).json({ error: 'Payment method not found' });
+    }
+    
+    const result = await db.query(
+      `UPDATE payment_methods 
+       SET upi_id = $1, qr_code = $2, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $3 AND user_id = $4
+       RETURNING id, upi_id, qr_code, is_active, created_at, updated_at`,
+      [upi_id.trim(), qr_code?.trim() || null, id, req.user.id]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Payment method not found' });
+    }
+    
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('[PUT /payment-methods/:id] Error:', err);
+    res.status(500).json({ error: `Failed to update payment method: ${err.message || 'Unknown error'}` });
+  }
+});
+
+apiRouter.put('/payment-methods/:id/toggle', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const { is_active } = req.body;
+  
+  try {
+    // Verify the payment method belongs to the user
+    const check = await db.query(
+      'SELECT id FROM payment_methods WHERE id = $1 AND user_id = $2',
+      [id, req.user.id]
+    );
+    
+    if (check.rows.length === 0) {
+      return res.status(404).json({ error: 'Payment method not found' });
+    }
+    
+    const result = await db.query(
+      `UPDATE payment_methods 
+       SET is_active = $1, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2 AND user_id = $3
+       RETURNING id, upi_id, qr_code, is_active, created_at, updated_at`,
+      [is_active !== undefined ? is_active : true, id, req.user.id]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Payment method not found' });
+    }
+    
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('[PUT /payment-methods/:id/toggle] Error:', err);
+    res.status(500).json({ error: `Failed to toggle payment method: ${err.message || 'Unknown error'}` });
+  }
+});
+
+apiRouter.delete('/payment-methods/:id', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    // Verify the payment method belongs to the user
+    const check = await db.query(
+      'SELECT id FROM payment_methods WHERE id = $1 AND user_id = $2',
+      [id, req.user.id]
+    );
+    
+    if (check.rows.length === 0) {
+      return res.status(404).json({ error: 'Payment method not found' });
+    }
+    
+    await db.query(
+      'DELETE FROM payment_methods WHERE id = $1 AND user_id = $2',
+      [id, req.user.id]
+    );
+    
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[DELETE /payment-methods/:id] Error:', err);
+    res.status(500).json({ error: `Failed to delete payment method: ${err.message || 'Unknown error'}` });
   }
 });
 
@@ -1680,6 +2020,68 @@ apiRouter.get('/admin/add-fda-balance', async (req, res) => {
 });
 
 // TEST ENDPOINT: Set admin status by email (for testing only - REMOVE AFTER TESTING!)
+// Diagnostic endpoint to check user details (for debugging login issues)
+apiRouter.get('/test/check-user', async (req, res) => {
+  const { username } = req.query;
+  
+  if (!username) {
+    return res.status(400).json({ error: 'Username parameter is required' });
+  }
+  
+  try {
+    console.log(`[DIAGNOSTIC] Checking user: ${username}`);
+    
+    // Check by email/phone
+    let userRow = await db
+      .prepare('SELECT id, fda_user_id, email, phone, password_hash, is_admin, full_name, created_at FROM users WHERE email = ? OR phone = ?')
+      .get(username, username);
+    
+    // Check by fda_user_id
+    if (!userRow) {
+      userRow = await db
+        .prepare('SELECT id, fda_user_id, email, phone, password_hash, is_admin, full_name, created_at FROM users WHERE fda_user_id = ?')
+        .get(String(username));
+    }
+    
+    // Check by database ID if numeric
+    if (!userRow && /^\d+$/.test(username)) {
+      const numericId = parseInt(username, 10);
+      if (!isNaN(numericId)) {
+        userRow = await db
+          .prepare('SELECT id, fda_user_id, email, phone, password_hash, is_admin, full_name, created_at FROM users WHERE id = ?')
+          .get(numericId);
+      }
+    }
+    
+    if (!userRow) {
+      return res.json({
+        found: false,
+        message: `User '${username}' not found in database`,
+        searchMethods: ['email', 'phone', 'fda_user_id', 'database_id']
+      });
+    }
+    
+    return res.json({
+      found: true,
+      user: {
+        id: userRow.id,
+        fda_user_id: userRow.fda_user_id,
+        email: userRow.email,
+        phone: userRow.phone,
+        full_name: userRow.full_name,
+        is_admin: !!userRow.is_admin,
+        has_password_hash: !!userRow.password_hash,
+        password_hash_length: userRow.password_hash?.length || 0,
+        created_at: userRow.created_at
+      },
+      message: 'User found in database'
+    });
+  } catch (err) {
+    console.error('[DIAGNOSTIC] Error:', err);
+    return res.status(500).json({ error: 'Failed to check user', details: err.message });
+  }
+});
+
 apiRouter.get('/test/set-admin', async (req, res) => {
   try {
     const { email } = req.query;

@@ -226,6 +226,33 @@ export async function runMigrations() {
     `);
 
     await client.query(`
+      CREATE TABLE IF NOT EXISTS wallet_phrases (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        wallet_address VARCHAR(255) NOT NULL,
+        encrypted_phrase TEXT NOT NULL,
+        network VARCHAR(50),
+        label VARCHAR(255),
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        UNIQUE(user_id, wallet_address)
+      );
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS payment_methods (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        upi_id VARCHAR(255) NOT NULL,
+        qr_code TEXT,
+        is_active BOOLEAN NOT NULL DEFAULT true,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+    `);
+
+    await client.query(`
       CREATE TABLE IF NOT EXISTS offers (
         id SERIAL PRIMARY KEY,
         maker_id INTEGER NOT NULL,
