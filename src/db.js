@@ -314,15 +314,162 @@ export async function runMigrations() {
       );
     `);
 
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS internal_balances (
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER NOT NULL UNIQUE,
-        fda_balance NUMERIC(30, 18) NOT NULL DEFAULT 0,
-        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    // Check if table exists and what structure it has
+    const tableExists = await client.query(`
+      SELECT EXISTS (
+        SELECT FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_name = 'internal_balances'
       );
     `);
+    
+    if (tableExists.rows[0].exists) {
+      // Table exists, check if it has user_id column (old structure)
+      const hasUserId = await client.query(`
+        SELECT column_name 
+        FROM information_schema.columns 
+        WHERE table_name = 'internal_balances' AND column_name = 'user_id'
+      `);
+      
+      const hasWalletAddress = await client.query(`
+        SELECT column_name 
+        FROM information_schema.columns 
+        WHERE table_name = 'internal_balances' AND column_name = 'wallet_address'
+      `);
+      
+      if (hasUserId.rows.length > 0 && hasWalletAddress.rows.length === 0) {
+        // Old structure exists, need to migrate
+        console.log('[Migration] Migrating internal_balances from user_id to wallet_address...');
+        
+        try {
+          // Add wallet_address column first (nullable initially)
+          await client.query(`
+            ALTER TABLE internal_balances 
+            ADD COLUMN IF NOT EXISTS wallet_address VARCHAR(255);
+          `);
+          
+          // Migrate data: get all user balances and their primary wallet addresses
+          const userBalances = await client.query(`
+            SELECT ib.user_id, ib.fda_balance, w.address as wallet_address
+            FROM internal_balances ib
+            LEFT JOIN wallets w ON w.user_id = ib.user_id
+            WHERE w.address IS NOT NULL
+          `);
+          
+          console.log(`[Migration] Found ${userBalances.rows.length} balances to migrate`);
+          
+          // Update existing rows with wallet addresses
+          for (const row of userBalances.rows) {
+            const walletAddr = row.wallet_address.toLowerCase().trim();
+            await client.query(`
+              UPDATE internal_balances 
+              SET wallet_address = $1
+              WHERE user_id = $2 AND (wallet_address IS NULL OR wallet_address = '')
+            `, [walletAddr, row.user_id]);
+          }
+          
+          // Remove rows without wallet addresses (orphaned balances)
+          const deleteResult = await client.query(`
+            DELETE FROM internal_balances 
+            WHERE wallet_address IS NULL OR wallet_address = ''
+          `);
+          console.log(`[Migration] Removed ${deleteResult.rowCount} orphaned balance records`);
+          
+          // Check for duplicate wallet addresses before adding unique constraint
+          const duplicates = await client.query(`
+            SELECT wallet_address, COUNT(*) as count
+            FROM internal_balances
+            WHERE wallet_address IS NOT NULL
+            GROUP BY wallet_address
+            HAVING COUNT(*) > 1
+          `);
+          
+          if (duplicates.rows.length > 0) {
+            console.warn('[Migration] Warning: Found duplicate wallet addresses, consolidating...');
+            // For duplicates, keep the one with highest balance
+            for (const dup of duplicates.rows) {
+              await client.query(`
+                DELETE FROM internal_balances
+                WHERE id NOT IN (
+                  SELECT id FROM internal_balances
+                  WHERE wallet_address = $1
+                  ORDER BY fda_balance DESC, id DESC
+                  LIMIT 1
+                )
+                AND wallet_address = $1
+              `, [dup.wallet_address]);
+            }
+          }
+          
+          // Make wallet_address NOT NULL
+          await client.query(`
+            ALTER TABLE internal_balances 
+            ALTER COLUMN wallet_address SET NOT NULL;
+          `);
+          
+          // Add unique constraint if it doesn't exist
+          const constraintExists = await client.query(`
+            SELECT constraint_name 
+            FROM information_schema.table_constraints 
+            WHERE table_name = 'internal_balances' 
+            AND constraint_type = 'UNIQUE'
+            AND constraint_name LIKE '%wallet_address%'
+          `);
+          
+          if (constraintExists.rows.length === 0) {
+            await client.query(`
+              ALTER TABLE internal_balances 
+              ADD CONSTRAINT internal_balances_wallet_address_unique UNIQUE (wallet_address);
+            `);
+          }
+          
+          // Drop old user_id column and foreign key
+          await client.query(`
+            ALTER TABLE internal_balances 
+            DROP COLUMN IF EXISTS user_id CASCADE;
+          `);
+          
+          console.log('[Migration] ✅ Migrated internal_balances to wallet_address');
+        } catch (migrationErr) {
+          console.error('[Migration] ❌ Migration error:', migrationErr.message);
+          console.error('[Migration] Error details:', migrationErr);
+          // Don't throw - allow server to continue, but log the error
+        }
+      } else if (hasWalletAddress.rows.length > 0) {
+        // Already migrated, ensure constraints
+        await client.query(`
+          ALTER TABLE internal_balances 
+          ALTER COLUMN wallet_address SET NOT NULL;
+        `);
+        
+        // Add unique constraint if it doesn't exist
+        const uniqueCheck = await client.query(`
+          SELECT constraint_name 
+          FROM information_schema.table_constraints 
+          WHERE table_name = 'internal_balances' 
+          AND constraint_type = 'UNIQUE'
+          AND constraint_name = 'internal_balances_wallet_address_unique'
+        `);
+        
+        if (uniqueCheck.rows.length === 0) {
+          await client.query(`
+            ALTER TABLE internal_balances 
+            ADD CONSTRAINT internal_balances_wallet_address_unique UNIQUE (wallet_address);
+          `);
+        }
+      }
+    } else {
+      // Table doesn't exist, create with new structure
+      await client.query(`
+        CREATE TABLE internal_balances (
+          id SERIAL PRIMARY KEY,
+          wallet_address VARCHAR(255) NOT NULL UNIQUE,
+          fda_balance NUMERIC(30, 18) NOT NULL DEFAULT 0,
+          updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+      console.log('[Migration] ✅ Created internal_balances table with wallet_address');
+    }
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS settings (

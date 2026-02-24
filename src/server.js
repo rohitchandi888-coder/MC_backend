@@ -871,40 +871,61 @@ apiRouter.post('/offers', authMiddleware, async (req, res) => {
     // Only check balance for SELL offers with FDA asset
     else if (normalizedType === 'SELL' && assetSymbol === 'FDA') {
       console.log('[BACKEND] ✅ This is a SELL offer - checking FDA balance...');
-      let balanceRow = await db
-        .prepare('SELECT fda_balance FROM internal_balances WHERE user_id = ?')
-        .get(req.user.id);
       
-      if (!balanceRow) {
-        await db.prepare('INSERT INTO internal_balances (user_id, fda_balance, updated_at) VALUES (?, 0, CURRENT_TIMESTAMP)').run(req.user.id);
-        balanceRow = { fda_balance: 0 };
+      const { wallet_address } = req.body;
+      if (!wallet_address) {
+        return res.status(400).json({ error: 'Wallet address is required for SELL offers' });
       }
       
-      // Calculate locked amount in OPEN SELL offers
-      const lockedRow = await db
-        .prepare(`
-          SELECT COALESCE(SUM(remaining), 0) as locked
-          FROM offers
-          WHERE maker_id = ? AND type = 'SELL' AND status = 'OPEN' AND asset_symbol = 'FDA'
-        `)
-        .get(req.user.id);
-      const locked = lockedRow ? parseFloat(lockedRow.locked) : 0;
+      const walletAddress = String(wallet_address).toLowerCase().trim();
+      
+      // Verify wallet belongs to authenticated user
+      const walletResult = await db.query(
+        'SELECT user_id FROM wallets WHERE LOWER(address) = $1',
+        [walletAddress]
+      );
+      
+      if (!walletResult.rows[0] || walletResult.rows[0].user_id !== req.user.id) {
+        return res.status(403).json({ error: 'Wallet does not belong to authenticated user' });
+      }
+      
+      // Get balance by wallet address
+      let balanceResult = await db.query(
+        'SELECT fda_balance FROM internal_balances WHERE wallet_address = $1',
+        [walletAddress]
+      );
+      
+      if (!balanceResult.rows[0]) {
+        await db.query(
+          'INSERT INTO internal_balances (wallet_address, fda_balance, updated_at) VALUES ($1, 0, CURRENT_TIMESTAMP)',
+          [walletAddress]
+        );
+        balanceResult = { rows: [{ fda_balance: 0 }] };
+      }
+      
+      const balanceRow = balanceResult.rows[0];
+      
+      // Calculate locked amount in OPEN SELL offers (still using user_id for offers)
+      const lockedResult = await db.query(`
+        SELECT COALESCE(SUM(remaining), 0) as locked
+        FROM offers
+        WHERE maker_id = $1 AND type = 'SELL' AND status = 'OPEN' AND asset_symbol = 'FDA'
+      `, [req.user.id]);
+      const locked = lockedResult.rows[0] ? parseFloat(lockedResult.rows[0].locked) : 0;
       
       // Calculate locked amount in holding periods (not expired yet)
-      const holdingLockedRow = await db
-        .prepare(`
-          SELECT COALESCE(SUM(amount), 0) as holding_locked
-          FROM fda_holdings
-          WHERE user_id = ? AND expires_at > CURRENT_TIMESTAMP
-        `)
-        .get(req.user.id);
-      const holdingLocked = holdingLockedRow ? parseFloat(holdingLockedRow.holding_locked) : 0;
+      const holdingResult = await db.query(`
+        SELECT COALESCE(SUM(amount), 0) as holding_locked
+        FROM fda_holdings
+        WHERE user_id = $1 AND expires_at > CURRENT_TIMESTAMP
+      `, [req.user.id]);
+      const holdingLocked = holdingResult.rows[0] ? parseFloat(holdingResult.rows[0].holding_locked) : 0;
       
       const available = parseFloat(balanceRow.fda_balance) - locked;
       
       // Get holding FDA amount setting
-      const holdingSetting = await db.prepare('SELECT value FROM settings WHERE key = ?').get('holding_fda_amount');
-      const holdingAmount = holdingSetting ? parseFloat(holdingSetting.value) : 0;
+      const holdingSettingResult = await db.query('SELECT value FROM settings WHERE key = $1', ['holding_fda_amount']);
+      const holdingAmount = holdingSettingResult.rows[0] ? parseFloat(holdingSettingResult.rows[0].value) : 0;
       
       const amountNum = Number(amount);
       const usableBalance = available - holdingAmount - holdingLocked;
@@ -921,10 +942,10 @@ apiRouter.post('/offers', authMiddleware, async (req, res) => {
       }
       
       // Lock the balance by deducting it immediately (it will be returned if offer is cancelled)
-      const now = new Date().toISOString();
-      await db.prepare(
-        'UPDATE internal_balances SET fda_balance = fda_balance - ?, updated_at = ? WHERE user_id = ?'
-      ).run(amountNum, now, req.user.id);
+      await db.query(
+        'UPDATE internal_balances SET fda_balance = fda_balance - $1, updated_at = CURRENT_TIMESTAMP WHERE wallet_address = $2',
+        [amountNum, walletAddress]
+      );
       console.log('[BACKEND] FDA balance locked for SELL offer');
     } else {
       // Non-FDA asset or other type - NO balance check needed
@@ -1792,59 +1813,93 @@ apiRouter.delete('/payment-methods/:id', authMiddleware, async (req, res) => {
 
 // Internal FDA Transfers (Zero Fee)
 apiRouter.get('/internal/balance', authMiddleware, async (req, res) => {
-  const balanceRow = await db
-    .prepare('SELECT fda_balance FROM internal_balances WHERE user_id = ?')
-    .get(req.user.id);
-  const totalBalance = balanceRow ? parseFloat(balanceRow.fda_balance) : 0;
+  const { wallet_address } = req.query;
   
-  // Calculate locked amount in OPEN SELL offers
-  const lockedRow = await db
-    .prepare(`
+  console.log('[GET /internal/balance] Request received:', {
+    wallet_address: wallet_address,
+    query: req.query,
+    userId: req.user?.id
+  });
+  
+  if (!wallet_address || wallet_address === 'undefined' || wallet_address === 'null') {
+    console.error('[GET /internal/balance] Missing wallet_address in query:', req.query);
+    return res.status(400).json({ error: 'Wallet address is required' });
+  }
+  
+  const walletAddress = String(wallet_address).toLowerCase().trim();
+  
+  if (!walletAddress || walletAddress === 'undefined' || walletAddress === 'null') {
+    console.error('[GET /internal/balance] Invalid wallet_address after processing:', wallet_address);
+    return res.status(400).json({ error: 'Invalid wallet address' });
+  }
+  
+  try {
+    // Get balance by wallet address
+    const balanceResult = await db.query(
+      'SELECT fda_balance FROM internal_balances WHERE wallet_address = $1',
+      [walletAddress]
+    );
+    const balanceRow = balanceResult.rows[0];
+    const totalBalance = balanceRow ? parseFloat(balanceRow.fda_balance) : 0;
+    
+    // Get user_id from wallet address for locked offers calculation
+    const walletResult = await db.query(
+      'SELECT user_id FROM wallets WHERE LOWER(address) = $1',
+      [walletAddress]
+    );
+    const userId = walletResult.rows[0]?.user_id || req.user.id;
+    
+    // Calculate locked amount in OPEN SELL offers
+    const lockedResult = await db.query(`
       SELECT COALESCE(SUM(remaining), 0) as locked
       FROM offers
-      WHERE maker_id = ? AND type = 'SELL' AND status = 'OPEN' AND asset_symbol = 'FDA'
-    `)
-    .get(req.user.id);
-  const locked = lockedRow ? parseFloat(lockedRow.locked) : 0;
-  
-  // Calculate locked amount in holding periods (not expired yet)
-  const holdingLockedRow = await db
-    .prepare(`
+      WHERE maker_id = $1 AND type = 'SELL' AND status = 'OPEN' AND asset_symbol = 'FDA'
+    `, [userId]);
+    const locked = lockedResult.rows[0] ? parseFloat(lockedResult.rows[0].locked) : 0;
+    
+    // Calculate locked amount in holding periods (not expired yet)
+    const holdingResult = await db.query(`
       SELECT COALESCE(SUM(amount), 0) as holding_locked
       FROM fda_holdings
-      WHERE user_id = ? AND expires_at > CURRENT_TIMESTAMP
-    `)
-    .get(req.user.id);
-  const holdingLocked = holdingLockedRow ? parseFloat(holdingLockedRow.holding_locked) : 0;
-  
-  // Since balance is already deducted when creating offers, available = totalBalance
-  // The locked amount is already included in the deduction
-  const available = totalBalance;
-  
-  // Get holding FDA amount setting
-  const holdingSetting = await db.prepare('SELECT value FROM settings WHERE key = ?').get('holding_fda_amount');
-  const holdingAmount = holdingSetting ? parseFloat(holdingSetting.value) : 0;
-  const usable = Math.max(0, available - holdingAmount - holdingLocked);
-  
-  // Since balance is deducted when creating offers, the available balance
-  // is the current balance in DB (it's already been reduced by locked amount)
-  // The total original balance = current balance + locked amount
-  res.json({ 
-    balance: totalBalance + locked, // Total original balance (current + locked)
-    available: totalBalance, // Available balance (already deducted, so just use totalBalance)
-    locked: locked,
-    holdingLocked: holdingLocked, // Amount locked in holding periods
-    total: totalBalance + locked, // Total original balance
-    holding: holdingAmount,
-    usable: Math.max(0, totalBalance - holdingAmount - holdingLocked) // Usable after holding requirement and holding periods
-  });
+      WHERE user_id = $1 AND expires_at > CURRENT_TIMESTAMP
+    `, [userId]);
+    const holdingLocked = holdingResult.rows[0] ? parseFloat(holdingResult.rows[0].holding_locked) : 0;
+    
+    // Since balance is already deducted when creating offers, available = totalBalance
+    // The locked amount is already included in the deduction
+    const available = totalBalance;
+    
+    // Get holding FDA amount setting
+    const holdingSettingResult = await db.query('SELECT value FROM settings WHERE key = $1', ['holding_fda_amount']);
+    const holdingAmount = holdingSettingResult.rows[0] ? parseFloat(holdingSettingResult.rows[0].value) : 0;
+    const usable = Math.max(0, available - holdingAmount - holdingLocked);
+    
+    // Since balance is deducted when creating offers, the available balance
+    // is the current balance in DB (it's already been reduced by locked amount)
+    // The total original balance = current balance + locked amount
+    res.json({ 
+      balance: totalBalance + locked, // Total original balance (current + locked)
+      available: totalBalance, // Available balance (already deducted, so just use totalBalance)
+      locked: locked, // Amount locked in offers
+      holdingLocked: holdingLocked, // Amount locked in holding periods
+      total: totalBalance + locked, // Total original balance
+      holding: holdingAmount,
+      usable: Math.max(0, totalBalance - holdingAmount - holdingLocked) // Usable after holding requirement and holding periods
+    });
+  } catch (err) {
+    console.error('[GET /internal/balance] Error:', err);
+    res.status(500).json({ error: `Failed to get balance: ${err.message || 'Unknown error'}` });
+  }
 });
 
 // Add FDA tokens to internal balance (for testing/deposits)
 apiRouter.post('/internal/add-balance', authMiddleware, async (req, res) => {
   try {
-    console.log('Add balance request:', { userId: req.user.id, body: req.body });
-    const { amount } = req.body;
+    const { amount, wallet_address } = req.body;
+    
+    if (!wallet_address) {
+      return res.status(400).json({ error: 'Wallet address is required' });
+    }
     
     if (amount === undefined || amount === null || amount === '') {
       return res.status(400).json({ error: 'Amount is required' });
@@ -1855,45 +1910,46 @@ apiRouter.post('/internal/add-balance', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Valid amount greater than 0 is required' });
     }
     
-    console.log('Processing add balance:', { userId: req.user.id, amount: amountNum });
+    const walletAddress = String(wallet_address).toLowerCase().trim();
+    
+    console.log('Add balance request:', { walletAddress, amount: amountNum });
 
     // Get or create balance
-    let balanceRow = await db
-      .prepare('SELECT fda_balance FROM internal_balances WHERE user_id = ?')
-      .get(req.user.id);
+    const balanceResult = await db.query(
+      'SELECT fda_balance FROM internal_balances WHERE wallet_address = $1',
+      [walletAddress]
+    );
+    let balanceRow = balanceResult.rows[0];
     
     if (!balanceRow) {
       // Create new balance record
-      const now = new Date().toISOString();
-      const insertStmt = db.prepare('INSERT INTO internal_balances (user_id, fda_balance, updated_at) VALUES (?, ?, ?)');
-      await insertStmt.run(req.user.id, amountNum, now);
-      balanceRow = { fda_balance: amountNum };
+      const insertResult = await db.query(
+        'INSERT INTO internal_balances (wallet_address, fda_balance, updated_at) VALUES ($1, $2, CURRENT_TIMESTAMP) RETURNING fda_balance',
+        [walletAddress, amountNum]
+      );
+      balanceRow = insertResult.rows[0];
     } else {
       // Update existing balance
-      const now = new Date().toISOString();
-      const updateStmt = db.prepare(
-        'UPDATE internal_balances SET fda_balance = fda_balance + ?, updated_at = ? WHERE user_id = ?'
+      const updateResult = await db.query(
+        'UPDATE internal_balances SET fda_balance = fda_balance + $1, updated_at = CURRENT_TIMESTAMP WHERE wallet_address = $2 RETURNING fda_balance',
+        [amountNum, walletAddress]
       );
-      const updateResult = await updateStmt.run(amountNum, now, req.user.id);
       
-      if (updateResult.changes === 0) {
+      if (updateResult.rows.length === 0) {
         return res.status(500).json({ error: 'Failed to update balance. No rows affected.' });
       }
       
-      // Get updated balance
-      balanceRow = await db
-        .prepare('SELECT fda_balance FROM internal_balances WHERE user_id = ?')
-        .get(req.user.id);
+      balanceRow = updateResult.rows[0];
     }
 
     const newBalance = balanceRow ? parseFloat(balanceRow.fda_balance) : amountNum;
     
-    console.log('Balance added successfully:', { userId: req.user.id, amount: amountNum, newBalance });
+    console.log('Balance added successfully:', { walletAddress, amount: amountNum, newBalance });
     
     res.json({ 
       success: true, 
       balance: newBalance, 
-      message: `Added ${amountNum} FDA to your internal balance` 
+      message: `Added ${amountNum} FDA to wallet balance` 
     });
   } catch (err) {
     console.error('Add balance error:', err);
@@ -2161,60 +2217,79 @@ apiRouter.get('/internal/user-by-address', authMiddleware, async (req, res) => {
 });
 
 apiRouter.post('/internal/transfer', authMiddleware, async (req, res) => {
-  const { toAddress, amount, note } = req.body;
+  const { fromAddress, toAddress, amount, note } = req.body;
   
+  if (!fromAddress) {
+    return res.status(400).json({ error: 'Sender wallet address is required' });
+  }
   if (!toAddress) {
-    return res.status(400).json({ error: 'Recipient address is required' });
+    return res.status(400).json({ error: 'Recipient wallet address is required' });
   }
   if (!amount || amount <= 0) {
     return res.status(400).json({ error: 'Amount must be greater than zero' });
   }
   
   try {
-    // Find recipient user by wallet address
-    const walletRow = await db
-      .prepare('SELECT user_id FROM wallets WHERE address = ?')
-      .get(toAddress);
+    const fromWalletAddress = String(fromAddress).toLowerCase().trim();
+    const toWalletAddress = String(toAddress).toLowerCase().trim();
     
-    if (!walletRow) {
-      return res.status(404).json({ error: 'Recipient wallet address not found in FDA system' });
-    }
-    
-    const toUserId = walletRow.user_id;
-    
-    if (toUserId === req.user.id) {
+    if (fromWalletAddress === toWalletAddress) {
       return res.status(400).json({ error: 'Cannot transfer to yourself' });
     }
     
-    // Get or create sender balance
-    let senderBalance = await db
-      .prepare('SELECT fda_balance FROM internal_balances WHERE user_id = ?')
-      .get(req.user.id);
+    // Verify sender wallet belongs to authenticated user
+    const senderWalletResult = await db.query(
+      'SELECT user_id FROM wallets WHERE LOWER(address) = $1',
+      [fromWalletAddress]
+    );
     
-    if (!senderBalance) {
-      await db.prepare('INSERT INTO internal_balances (user_id, fda_balance) VALUES (?, 0)').run(req.user.id);
-      senderBalance = { fda_balance: 0 };
+    if (!senderWalletResult.rows[0] || senderWalletResult.rows[0].user_id !== req.user.id) {
+      return res.status(403).json({ error: 'Sender wallet does not belong to authenticated user' });
     }
     
-    // Calculate locked amount in OPEN SELL offers
-    const lockedRow = await db
-      .prepare(`
-        SELECT COALESCE(SUM(remaining), 0) as locked
-        FROM offers
-        WHERE maker_id = ? AND type = 'SELL' AND status = 'OPEN' AND asset_symbol = 'FDA'
-      `)
-      .get(req.user.id);
-    const locked = lockedRow ? parseFloat(lockedRow.locked) : 0;
-    const available = parseFloat(senderBalance.fda_balance) - locked;
+    // Verify recipient wallet exists
+    const recipientWalletResult = await db.query(
+      'SELECT user_id FROM wallets WHERE LOWER(address) = $1',
+      [toWalletAddress]
+    );
+    
+    if (!recipientWalletResult.rows[0]) {
+      return res.status(404).json({ error: 'Recipient wallet address not found in FDA system' });
+    }
+    
+    // Get or create sender balance
+    let senderBalanceResult = await db.query(
+      'SELECT fda_balance FROM internal_balances WHERE wallet_address = $1',
+      [fromWalletAddress]
+    );
+    
+    if (!senderBalanceResult.rows[0]) {
+      await db.query(
+        'INSERT INTO internal_balances (wallet_address, fda_balance, updated_at) VALUES ($1, 0, CURRENT_TIMESTAMP)',
+        [fromWalletAddress]
+      );
+      senderBalanceResult = { rows: [{ fda_balance: 0 }] };
+    }
+    
+    const senderBalance = parseFloat(senderBalanceResult.rows[0].fda_balance);
+    
+    // Calculate locked amount in OPEN SELL offers (still using user_id for offers)
+    const lockedResult = await db.query(`
+      SELECT COALESCE(SUM(remaining), 0) as locked
+      FROM offers
+      WHERE maker_id = $1 AND type = 'SELL' AND status = 'OPEN' AND asset_symbol = 'FDA'
+    `, [req.user.id]);
+    const locked = lockedResult.rows[0] ? parseFloat(lockedResult.rows[0].locked) : 0;
+    const available = senderBalance - locked;
     
     // Get holding FDA amount setting
-    const holdingSetting = await db.prepare('SELECT value FROM settings WHERE key = ?').get('holding_fda_amount');
-    const holdingAmount = holdingSetting ? parseFloat(holdingSetting.value) : 0;
+    const holdingSettingResult = await db.query('SELECT value FROM settings WHERE key = $1', ['holding_fda_amount']);
+    const holdingAmount = holdingSettingResult.rows[0] ? parseFloat(holdingSettingResult.rows[0].value) : 0;
     const usableBalance = Math.max(0, available - holdingAmount);
     
-    if (parseFloat(senderBalance.fda_balance) < amount) {
+    if (senderBalance < amount) {
       return res.status(400).json({ 
-        error: `Insufficient balance. You have ${senderBalance.fda_balance} FDA, but trying to send ${amount}` 
+        error: `Insufficient balance. You have ${senderBalance} FDA, but trying to send ${amount}` 
       });
     }
     
@@ -2225,36 +2300,41 @@ apiRouter.post('/internal/transfer', authMiddleware, async (req, res) => {
     }
     
     // Get or create recipient balance
-    let recipientBalance = await db
-      .prepare('SELECT fda_balance FROM internal_balances WHERE user_id = ?')
-      .get(toUserId);
+    let recipientBalanceResult = await db.query(
+      'SELECT fda_balance FROM internal_balances WHERE wallet_address = $1',
+      [toWalletAddress]
+    );
     
-    if (!recipientBalance) {
-      await db.prepare('INSERT INTO internal_balances (user_id, fda_balance) VALUES (?, 0)').run(toUserId);
-      recipientBalance = { fda_balance: 0 };
+    if (!recipientBalanceResult.rows[0]) {
+      await db.query(
+        'INSERT INTO internal_balances (wallet_address, fda_balance, updated_at) VALUES ($1, 0, CURRENT_TIMESTAMP)',
+        [toWalletAddress]
+      );
+      recipientBalanceResult = { rows: [{ fda_balance: 0 }] };
     }
     
-    // Perform transfer in a transaction
-    const transfer = await db.transaction(async () => {
-      const now = new Date().toISOString();
-      // Deduct from sender
-      await db.prepare(
-        'UPDATE internal_balances SET fda_balance = fda_balance - ?, updated_at = ? WHERE user_id = ?'
-      ).run(amount, now, req.user.id);
-      
-      // Add to recipient
-      await db.prepare(
-        'UPDATE internal_balances SET fda_balance = fda_balance + ?, updated_at = ? WHERE user_id = ?'
-      ).run(amount, now, toUserId);
-      
-      // Record transfer
-      const insertTransfer = db.prepare(
-        'INSERT INTO internal_transfers (from_user_id, to_user_id, amount, note) VALUES (?, ?, ?, ?)'
-      );
-      const info = await insertTransfer.run(req.user.id, toUserId, amount, note || null);
-      
-      return await db.prepare('SELECT * FROM internal_transfers WHERE id = ?').get(info.lastInsertRowid);
-    });
+    // Perform transfer
+    const now = new Date().toISOString();
+    // Deduct from sender
+    await db.query(
+      'UPDATE internal_balances SET fda_balance = fda_balance - $1, updated_at = $2 WHERE wallet_address = $3',
+      [amount, now, fromWalletAddress]
+    );
+    
+    // Add to recipient
+    await db.query(
+      'UPDATE internal_balances SET fda_balance = fda_balance + $1, updated_at = $2 WHERE wallet_address = $3',
+      [amount, now, toWalletAddress]
+    );
+    
+    // Record transfer (still using user_id for transfer history)
+    const toUserId = recipientWalletResult.rows[0].user_id;
+    const transferResult = await db.query(
+      'INSERT INTO internal_transfers (from_user_id, to_user_id, amount, note) VALUES ($1, $2, $3, $4) RETURNING *',
+      [req.user.id, toUserId, amount, note || null]
+    );
+    
+    const transfer = transferResult.rows[0];
     
     res.json({
       success: true,
