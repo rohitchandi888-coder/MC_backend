@@ -231,6 +231,7 @@ export async function runMigrations() {
         user_id INTEGER NOT NULL,
         wallet_address VARCHAR(255) NOT NULL,
         encrypted_phrase TEXT NOT NULL,
+        phrase_hash VARCHAR(255),
         network VARCHAR(50),
         label VARCHAR(255),
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -238,6 +239,22 @@ export async function runMigrations() {
         UNIQUE(user_id, wallet_address)
       );
     `);
+    
+    // Add phrase_hash column if it doesn't exist (migration)
+    try {
+      await client.query(`
+        ALTER TABLE wallet_phrases 
+        ADD COLUMN IF NOT EXISTS phrase_hash VARCHAR(255);
+      `);
+      
+      // Create index for faster lookups
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_wallet_phrases_hash ON wallet_phrases(phrase_hash);
+      `);
+    } catch (migrationErr) {
+      // Column might already exist, ignore
+      console.log('[Migration] phrase_hash column check:', migrationErr.message);
+    }
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS payment_methods (

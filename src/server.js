@@ -3,6 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
 import { db, runMigrations } from './db.js';
 
 const app = express();
@@ -1585,13 +1586,18 @@ apiRouter.post('/wallets/save-phrase', authMiddleware, async (req, res) => {
       ? encryptedPhrase 
       : JSON.stringify(encryptedPhrase);
     
+    // Extract mnemonic12 and extraWord from encrypted phrase to create hash
+    // Note: We can't decrypt here, so we'll need the frontend to send the hash
+    // For now, we'll accept phraseHash as optional parameter
+    const { phraseHash } = req.body;
+    
     const result = await db.query(
-      `INSERT INTO wallet_phrases (user_id, wallet_address, encrypted_phrase, network, label)
-       VALUES ($1, LOWER($2), $3, $4, $5)
+      `INSERT INTO wallet_phrases (user_id, wallet_address, encrypted_phrase, phrase_hash, network, label)
+       VALUES ($1, LOWER($2), $3, $4, $5, $6)
        ON CONFLICT (user_id, wallet_address) 
-       DO UPDATE SET encrypted_phrase = $3, network = $4, label = $5, created_at = CURRENT_TIMESTAMP
+       DO UPDATE SET encrypted_phrase = $3, phrase_hash = $4, network = $5, label = $6, created_at = CURRENT_TIMESTAMP
        RETURNING id, wallet_address, network, label, created_at`,
-      [req.user.id, walletAddress, encryptedPhraseStr, network || null, label || null]
+      [req.user.id, walletAddress, encryptedPhraseStr, phraseHash || null, network || null, label || null]
     );
     
     console.log(`[POST /wallets/save-phrase] Successfully saved phrase for wallet ${walletAddress}`);
@@ -1600,6 +1606,55 @@ apiRouter.post('/wallets/save-phrase', authMiddleware, async (req, res) => {
     console.error('[POST /wallets/save-phrase] Error:', err);
     console.error('[POST /wallets/save-phrase] Error stack:', err.stack);
     res.status(500).json({ error: `Failed to save phrase: ${err.message || 'Unknown error'}` });
+  }
+});
+
+// Check if a phrase (12+13 words) is already used by another user
+apiRouter.post('/wallets/check-phrase', async (req, res) => {
+  try {
+    const { mnemonic12, extraWord, userId } = req.body;
+    
+    if (!mnemonic12 || !extraWord) {
+      return res.status(400).json({ 
+        error: 'Missing required fields',
+        message: 'mnemonic12 and extraWord are required' 
+      });
+    }
+    
+    // Create hash of the phrase combination (normalized)
+    const phraseCombination = `${mnemonic12.trim().toLowerCase()}:${extraWord.trim().toLowerCase()}`;
+    const phraseHash = crypto.createHash('sha256').update(phraseCombination).digest('hex');
+    
+    // Check if this hash exists for another user
+    const existingPhrase = await db.query(`
+      SELECT wp.id, wp.user_id, wp.wallet_address, u.email, u.phone
+      FROM wallet_phrases wp
+      JOIN users u ON u.id = wp.user_id
+      WHERE wp.phrase_hash = $1 AND ($2::integer IS NULL OR wp.user_id != $2)
+      LIMIT 1
+    `, [phraseHash, userId || null]);
+    
+    if (existingPhrase.rows.length > 0) {
+      const existing = existingPhrase.rows[0];
+      return res.json({
+        exists: true,
+        usedBy: {
+          userId: existing.user_id,
+          email: existing.email,
+          phone: existing.phone,
+          walletAddress: existing.wallet_address
+        },
+        message: 'This wallet phrase (12+13 words) is already registered by another user in MC Wallet.'
+      });
+    }
+    
+    res.json({ 
+      exists: false,
+      message: 'Phrase is available' 
+    });
+  } catch (err) {
+    console.error('[POST /wallets/check-phrase] Error:', err);
+    res.status(500).json({ error: `Failed to check phrase: ${err.message || 'Unknown error'}` });
   }
 });
 
@@ -1960,16 +2015,17 @@ apiRouter.post('/internal/add-balance', authMiddleware, async (req, res) => {
   }
 });
 
-// Add FDA balance by FDA User ID - GET endpoint for testing (NO AUTH - REMOVE AFTER TESTING!)
+// Add FDA balance by Wallet Address - GET endpoint for testing (NO AUTH - REMOVE AFTER TESTING!)
 apiRouter.get('/admin/add-fda-balance', async (req, res) => {
   try {
-    const { fdauserid, fda } = req.query;
-    const fda_user_id = fdauserid;
+    const { wallet_address, fda } = req.query;
+    // Support both old parameter name (fdauserid) and new one (wallet_address) for backward compatibility
+    const walletAddressParam = wallet_address || req.query.fdauserid; // fdauserid can be wallet address now
     const fda_balance = fda;
     
     // Validate input
-    if (!fda_user_id) {
-      return res.status(400).json({ error: 'FDA user ID is required' });
+    if (!walletAddressParam) {
+      return res.status(400).json({ error: 'Wallet address is required (use wallet_address parameter)' });
     }
     
     if (fda_balance === undefined || fda_balance === null || fda_balance === '') {
@@ -1985,83 +2041,96 @@ apiRouter.get('/admin/add-fda-balance', async (req, res) => {
       return res.status(400).json({ error: 'FDA balance must be greater than 0' });
     }
     
+    const walletAddress = String(walletAddressParam).toLowerCase().trim();
+    
+    // Validate wallet address format (basic check)
+    if (!walletAddress.startsWith('0x') || walletAddress.length < 40) {
+      return res.status(400).json({ error: 'Invalid wallet address format' });
+    }
+    
     console.log(`\n[========================================]`);
-    console.log(`[ADMIN] 💰 Adding FDA balance for FDA User ID: ${fda_user_id}`);
+    console.log(`[ADMIN] 💰 Adding FDA balance for Wallet Address: ${walletAddress}`);
     console.log(`[ADMIN] Amount: ${balanceNum} FDA`);
     console.log(`[========================================]\n`);
     
-    // Find user by FDA user ID
-    const userRow = await db
-      .prepare('SELECT id, fda_user_id, email, phone FROM users WHERE fda_user_id = ?')
-      .get(fda_user_id);
+    // Find wallet info - REQUIRED: Wallet must be registered in MC Wallet
+    const walletResult = await db.query(
+      'SELECT w.user_id, w.label, u.email, u.phone, u.fda_user_id FROM wallets w LEFT JOIN users u ON u.id = w.user_id WHERE LOWER(w.address) = $1',
+      [walletAddress]
+    );
     
-    if (!userRow) {
-      console.log(`[ADMIN] ❌ User not found with FDA User ID: ${fda_user_id}`);
+    const walletInfo = walletResult.rows[0];
+    if (!walletInfo) {
+      console.log(`[ADMIN] ❌ Wallet not registered in MC Wallet system: ${walletAddress}`);
       return res.status(404).json({ 
-        error: 'User not found',
-        message: `No user found with FDA User ID: ${fda_user_id}. Please ensure the user has logged in first.`
+        error: 'Wallet not registered',
+        message: `Wallet address ${walletAddress} is not registered in MC Wallet. Please ensure the wallet is registered first before adding balance.`
       });
     }
     
-    const localUserId = userRow.id;
-    console.log(`[ADMIN] ✅ User found:`);
-    console.log(`  Local User ID: ${localUserId}`);
-    console.log(`  FDA User ID: ${userRow.fda_user_id}`);
-    console.log(`  Email: ${userRow.email || 'N/A'}`);
-    console.log(`  Phone: ${userRow.phone || 'N/A'}`);
+    console.log(`[ADMIN] ✅ Wallet found and registered:`);
+    console.log(`  User ID: ${walletInfo.user_id || 'N/A'}`);
+    console.log(`  Label: ${walletInfo.label || 'N/A'}`);
+    console.log(`  Email: ${walletInfo.email || 'N/A'}`);
+    console.log(`  Phone: ${walletInfo.phone || 'N/A'}`);
+    console.log(`  FDA User ID: ${walletInfo.fda_user_id || 'N/A'}`);
     
-    // Get or create balance record
-    let balanceRow = await db
-      .prepare('SELECT fda_balance FROM internal_balances WHERE user_id = ?')
-      .get(localUserId);
+    // Get or create balance record by wallet address
+    const balanceResult = await db.query(
+      'SELECT fda_balance FROM internal_balances WHERE wallet_address = $1',
+      [walletAddress]
+    );
     
-    const now = new Date().toISOString();
+    let balanceRow = balanceResult.rows[0];
+    const oldBalance = balanceRow ? parseFloat(balanceRow.fda_balance) : 0;
     
     if (!balanceRow) {
       // Create new balance record
-      console.log(`[ADMIN] Creating new balance record for user ${localUserId}`);
-      const insertStmt = db.prepare('INSERT INTO internal_balances (user_id, fda_balance, updated_at) VALUES (?, ?, ?)');
-      await insertStmt.run(localUserId, balanceNum, now);
-      balanceRow = { fda_balance: balanceNum };
+      console.log(`[ADMIN] Creating new balance record for wallet ${walletAddress}`);
+      const insertResult = await db.query(
+        'INSERT INTO internal_balances (wallet_address, fda_balance, updated_at) VALUES ($1, $2, CURRENT_TIMESTAMP) RETURNING fda_balance',
+        [walletAddress, balanceNum]
+      );
+      balanceRow = insertResult.rows[0];
     } else {
       // Update existing balance
-      console.log(`[ADMIN] Updating existing balance: ${balanceRow.fda_balance} + ${balanceNum}`);
-      const updateStmt = db.prepare(
-        'UPDATE internal_balances SET fda_balance = fda_balance + ?, updated_at = ? WHERE user_id = ?'
+      console.log(`[ADMIN] Updating existing balance: ${oldBalance} + ${balanceNum}`);
+      const updateResult = await db.query(
+        'UPDATE internal_balances SET fda_balance = fda_balance + $1, updated_at = CURRENT_TIMESTAMP WHERE wallet_address = $2 RETURNING fda_balance',
+        [balanceNum, walletAddress]
       );
-      const updateResult = await updateStmt.run(balanceNum, now, localUserId);
       
-      if (updateResult.changes === 0) {
+      if (updateResult.rows.length === 0) {
         console.error(`[ADMIN] ❌ Failed to update balance. No rows affected.`);
         return res.status(500).json({ error: 'Failed to update balance. No rows affected.' });
       }
       
-      // Get updated balance
-      balanceRow = await db
-        .prepare('SELECT fda_balance FROM internal_balances WHERE user_id = ?')
-        .get(localUserId);
+      balanceRow = updateResult.rows[0];
     }
     
     const newBalance = balanceRow ? parseFloat(balanceRow.fda_balance) : balanceNum;
     
     console.log(`[ADMIN] ✅ Balance added successfully:`);
-    console.log(`  Previous Balance: ${(newBalance - balanceNum).toFixed(8)} FDA`);
+    console.log(`  Wallet Address: ${walletAddress}`);
+    console.log(`  Previous Balance: ${oldBalance.toFixed(8)} FDA`);
     console.log(`  Amount Added: ${balanceNum.toFixed(8)} FDA`);
     console.log(`  New Balance: ${newBalance.toFixed(8)} FDA`);
     console.log(`[========================================]\n`);
     
     res.json({ 
       success: true,
-      message: `Successfully added ${balanceNum} FDA to user's balance`,
-      user: {
-        localUserId: localUserId,
-        fdaUserId: userRow.fda_user_id,
-        email: userRow.email,
-        phone: userRow.phone
+      message: `Successfully added ${balanceNum} FDA to wallet balance`,
+      wallet: {
+        address: walletAddress,
+        label: walletInfo?.label || null,
+        user_id: walletInfo?.user_id || null,
+        email: walletInfo?.email || null,
+        phone: walletInfo?.phone || null,
+        fda_user_id: walletInfo?.fda_user_id || null
       },
       balance: {
         amountAdded: balanceNum,
-        previousBalance: (newBalance - balanceNum),
+        previousBalance: oldBalance,
         newBalance: newBalance
       }
     });
