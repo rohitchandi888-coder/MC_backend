@@ -1468,7 +1468,7 @@ apiRouter.post('/trades/:id/disputes', authMiddleware, async (req, res) => {
 apiRouter.get('/wallets', authMiddleware, async (req, res) => {
   try {
     const result = await db.query(
-      'SELECT id, address, label, created_at FROM wallets WHERE user_id = $1 ORDER BY created_at DESC',
+      'SELECT id, address, label, encrypted_data, network, created_at FROM wallets WHERE user_id = $1 ORDER BY created_at DESC',
       [req.user.id]
     );
     res.json(result.rows);
@@ -1479,7 +1479,9 @@ apiRouter.get('/wallets', authMiddleware, async (req, res) => {
 });
 
 apiRouter.post('/wallets/register', authMiddleware, async (req, res) => {
-  const { address, label } = req.body;
+  const { address, label, encryptedData, network } = req.body;
+  console.log(`[POST /wallets/register] Received registration request for address: ${address}`);
+  console.log(`[POST /wallets/register] encryptedData provided: ${!!encryptedData}, type: ${encryptedData ? typeof encryptedData : 'none'}`);
   if (!address) {
     return res.status(400).json({ error: 'Wallet address is required' });
   }
@@ -1488,7 +1490,7 @@ apiRouter.post('/wallets/register', authMiddleware, async (req, res) => {
   
   // Validate address format (Ethereum/EVM, Solana, Bitcoin, or Tron)
   const isEthereumAddress = /^0x[a-f0-9]{40}$/i.test(trimmedAddress);
-  const isSolanaAddress = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(trimmedAddress); // Solana addresses are base58 encoded, 32-44 chars
+  const isSolanaAddress = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(trimmedAddress);
   const isBitcoinAddress = /^(bc1|[13])[a-zA-HJ-NP-Z0-9]{25,62}$/.test(trimmedAddress);
   const isTronAddress = /^T[A-Za-z1-9]{33}$/.test(trimmedAddress);
   
@@ -1496,24 +1498,72 @@ apiRouter.post('/wallets/register', authMiddleware, async (req, res) => {
     return res.status(400).json({ error: 'Invalid wallet address format. Supported: Ethereum (0x...), Solana, Bitcoin, or Tron addresses.' });
   }
   
-  // Normalize Ethereum addresses to lowercase for case-insensitive comparison
-  // Solana, Bitcoin, and Tron addresses are case-sensitive, so don't normalize them
   const normalizedAddress = isEthereumAddress ? trimmedAddress.toLowerCase() : trimmedAddress;
   
   try {
-    // Check if wallet already exists
-    // For Ethereum addresses, use case-insensitive comparison. For others, use exact match.
-    const existing = isEthereumAddress 
-      ? await db.prepare('SELECT * FROM wallets WHERE LOWER(address) = ?').get(normalizedAddress)
-      : await db.prepare('SELECT * FROM wallets WHERE address = ?').get(normalizedAddress);
+    // Check if wallet already exists (PostgreSQL)
+    const existingResult = await db.query(
+      isEthereumAddress 
+        ? 'SELECT * FROM wallets WHERE LOWER(address) = $1'
+        : 'SELECT * FROM wallets WHERE address = $1',
+      [normalizedAddress]
+    );
+    const existing = existingResult.rows[0];
+    
     if (existing) {
       if (existing.user_id === req.user.id) {
-        // Update label if same user
-        await db.prepare('UPDATE wallets SET label = ? WHERE id = ?').run(label || null, existing.id);
-        return res.json({ success: true, wallet: { ...existing, label: label || null } });
+        // Update label, encrypted_data, and network if same user
+        // Stringify encryptedData if it's an object
+        // IMPORTANT: If encryptedData is provided, ALWAYS use it (don't keep existing if new one is provided)
+        let encryptedDataStr = null;
+        if (encryptedData !== undefined && encryptedData !== null) {
+          encryptedDataStr = typeof encryptedData === 'string' ? encryptedData : JSON.stringify(encryptedData);
+        } else if (existing.encrypted_data) {
+          // Keep existing if no new one provided
+          encryptedDataStr = existing.encrypted_data;
+        }
+        console.log(`[POST /wallets/register] Updating existing wallet ${existing.id}:`);
+        console.log(`  - encryptedData provided: ${!!encryptedData}, type: ${encryptedData ? typeof encryptedData : 'none'}`);
+        console.log(`  - existing.encrypted_data: ${!!existing.encrypted_data}`);
+        console.log(`  - will save encryptedDataStr: ${!!encryptedDataStr}, length: ${encryptedDataStr ? encryptedDataStr.length : 0}`);
+        // Use explicit UPDATE - only update fields that are provided
+        // Build query dynamically to avoid null parameter type issues
+        const updateFields = [];
+        const updateValues = [];
+        let paramIndex = 1;
+        
+        if (label !== undefined && label !== null) {
+          updateFields.push(`label = $${paramIndex}::VARCHAR`);
+          updateValues.push(label);
+          paramIndex++;
+        }
+        
+        if (encryptedDataStr !== undefined && encryptedDataStr !== null) {
+          updateFields.push(`encrypted_data = $${paramIndex}::TEXT`);
+          updateValues.push(encryptedDataStr);
+          paramIndex++;
+        }
+        
+        if (network !== undefined && network !== null) {
+          updateFields.push(`network = $${paramIndex}::VARCHAR`);
+          updateValues.push(network);
+          paramIndex++;
+        }
+        
+        if (updateFields.length > 0) {
+          updateValues.push(existing.id);
+          await db.query(
+            `UPDATE wallets SET ${updateFields.join(', ')} WHERE id = $${paramIndex}::INTEGER`,
+            updateValues
+          );
+        }
+        const updatedResult = await db.query('SELECT * FROM wallets WHERE id = $1', [existing.id]);
+        const updatedWallet = updatedResult.rows[0];
+        console.log(`[POST /wallets/register] ✅ Wallet updated. encrypted_data: ${updatedWallet.encrypted_data ? 'YES (' + (typeof updatedWallet.encrypted_data === 'string' ? updatedWallet.encrypted_data.length : 'object') + ' chars)' : 'NO'}`);
+        return res.json({ success: true, wallet: updatedWallet });
       } else {
-        // Get the other user's email/phone for better error message
-        const otherUser = await db.prepare('SELECT email, phone, full_name FROM users WHERE id = ?').get(existing.user_id);
+        const otherUserResult = await db.query('SELECT email, phone, full_name FROM users WHERE id = $1', [existing.user_id]);
+        const otherUser = otherUserResult.rows[0];
         const otherUserInfo = otherUser?.email || otherUser?.phone || otherUser?.full_name || 'another user';
         console.warn(`⚠️  Attempt to register duplicate wallet: ${normalizedAddress} by user ${req.user.id}, already registered to user ${existing.user_id} (${otherUserInfo})`);
         return res.status(400).json({ 
@@ -1522,17 +1572,108 @@ apiRouter.post('/wallets/register', authMiddleware, async (req, res) => {
       }
     }
     
-    // Create new wallet entry (store in lowercase)
-    const stmt = db.prepare('INSERT INTO wallets (user_id, address, label) VALUES (?, ?, ?)');
-    const info = await stmt.run(req.user.id, normalizedAddress, label || null);
-    const wallet = await db.prepare('SELECT * FROM wallets WHERE id = ?').get(info.lastInsertRowid);
-    res.json({ success: true, wallet });
+    // Create new wallet entry
+    // Stringify encryptedData if it's an object
+    const encryptedDataStr = encryptedData 
+      ? (typeof encryptedData === 'string' ? encryptedData : JSON.stringify(encryptedData))
+      : null;
+    console.log(`[POST /wallets/register] Registering wallet ${normalizedAddress} for user ${req.user.id}`);
+    console.log(`[POST /wallets/register] encryptedData provided: ${!!encryptedData}, stringified length: ${encryptedDataStr ? encryptedDataStr.length : 0}`);
+    // Use explicit type casting to help PostgreSQL determine parameter types
+    // Ensure all parameters are properly typed and not undefined
+    // IMPORTANT: Cast parameters in the VALUES clause, not in the parameter array
+    if (!normalizedAddress) {
+      return res.status(400).json({ error: 'Wallet address is required and cannot be empty' });
+    }
+    
+    const insertParams = [
+      req.user.id,                    // $1
+      normalizedAddress,              // $2 (must be a string)
+      label || null,                   // $3
+      encryptedDataStr || null,        // $4
+      network || null                  // $5
+    ];
+    console.log(`[POST /wallets/register] INSERT params:`, {
+      user_id: insertParams[0],
+      address: insertParams[1],
+      addressType: typeof insertParams[1],
+      label: insertParams[2],
+      hasEncryptedData: !!insertParams[3],
+      network: insertParams[4]
+    });
+    
+    // Use explicit casting in the query to help PostgreSQL
+    const result = await db.query(
+      `INSERT INTO wallets (user_id, address, label, encrypted_data, network) 
+       VALUES ($1::INTEGER, $2::VARCHAR(255), $3::VARCHAR(255), $4::TEXT, $5::VARCHAR(50)) 
+       RETURNING *`,
+      insertParams
+    );
+    console.log(`[POST /wallets/register] ✅ Wallet registered successfully. ID: ${result.rows[0].id}, encrypted_data: ${result.rows[0].encrypted_data ? 'YES (' + (typeof result.rows[0].encrypted_data === 'string' ? result.rows[0].encrypted_data.length : 'object') + ' chars)' : 'NO'}`);
+    res.json({ success: true, wallet: result.rows[0] });
   } catch (err) {
     console.error('Wallet registration error:', err);
     if (String(err.message).includes('unique') || String(err.code) === '23505') {
       return res.status(400).json({ error: 'Wallet address already registered to another user' });
     }
     res.status(500).json({ error: `Failed to register wallet: ${err.message || 'Unknown error'}` });
+  }
+});
+
+// Delete wallet endpoint
+apiRouter.delete('/wallets/:walletId', authMiddleware, async (req, res) => {
+  const { walletId } = req.params;
+  console.log(`[DELETE /wallets/:walletId] Received delete request for wallet ID: ${walletId}, user ID: ${req.user.id}`);
+  
+  try {
+    // Get wallet info
+    const walletResult = await db.query(
+      'SELECT * FROM wallets WHERE id = $1 AND user_id = $2',
+      [walletId, req.user.id]
+    );
+    
+    if (walletResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Wallet not found' });
+    }
+    
+    const wallet = walletResult.rows[0];
+    const walletAddress = wallet.address?.toLowerCase();
+    
+    // Check if wallet has FDA balance
+    if (walletAddress) {
+      const balanceResult = await db.query(
+        'SELECT fda_balance FROM internal_balances WHERE wallet_address = $1',
+        [walletAddress]
+      );
+      
+      if (balanceResult.rows.length > 0) {
+        const balance = parseFloat(balanceResult.rows[0].fda_balance || 0);
+        if (balance > 0) {
+          return res.status(400).json({ 
+            error: `Cannot delete wallet with FDA balance. This wallet has ${balance} FDA. Please transfer or use the balance before deleting.`,
+            balance: balance,
+            walletAddress: walletAddress
+          });
+        }
+      }
+    }
+    
+    // Delete wallet from database
+    await db.query('DELETE FROM wallets WHERE id = $1 AND user_id = $2', [walletId, req.user.id]);
+    
+    // Also delete associated phrase if exists
+    if (walletAddress) {
+      await db.query(
+        'DELETE FROM wallet_phrases WHERE wallet_address = $1 AND user_id = $2',
+        [walletAddress, req.user.id]
+      );
+    }
+    
+    console.log(`[DELETE /wallets/${walletId}] Wallet deleted: ${walletAddress}`);
+    res.json({ success: true, message: 'Wallet deleted successfully' });
+  } catch (err) {
+    console.error('[DELETE /wallets] Error:', err);
+    res.status(500).json({ error: `Failed to delete wallet: ${err.message || 'Unknown error'}` });
   }
 });
 

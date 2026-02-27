@@ -220,10 +220,34 @@ export async function runMigrations() {
         user_id INTEGER NOT NULL,
         address VARCHAR(255) UNIQUE NOT NULL,
         label VARCHAR(255),
+        encrypted_data TEXT,
+        network VARCHAR(50),
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
       );
     `);
+    
+    // Add encrypted_data and network columns if they don't exist (migration)
+    try {
+      const columnsCheck = await client.query(`
+        SELECT column_name 
+        FROM information_schema.columns 
+        WHERE table_name = 'wallets' AND column_name IN ('encrypted_data', 'network')
+      `);
+      const existingColumns = columnsCheck.rows.map(r => r.column_name);
+      
+      if (!existingColumns.includes('encrypted_data')) {
+        await client.query(`ALTER TABLE wallets ADD COLUMN encrypted_data TEXT;`);
+        console.log('[Migration] ✅ Added encrypted_data column to wallets table');
+      }
+      
+      if (!existingColumns.includes('network')) {
+        await client.query(`ALTER TABLE wallets ADD COLUMN network VARCHAR(50);`);
+        console.log('[Migration] ✅ Added network column to wallets table');
+      }
+    } catch (migrationErr) {
+      console.error('[Migration] Error adding columns to wallets table:', migrationErr);
+    }
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS wallet_phrases (
