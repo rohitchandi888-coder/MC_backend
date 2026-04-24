@@ -543,6 +543,9 @@ export async function runMigrations() {
         amount NUMERIC(30, 18) NOT NULL,
         holding_period VARCHAR(20) NOT NULL,
         expires_at TIMESTAMP NOT NULL,
+        reward_rate NUMERIC(10, 4),
+        reward_amount NUMERIC(30, 18),
+        claimed_at TIMESTAMP,
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -559,6 +562,26 @@ export async function runMigrations() {
       await client.query(`ALTER TABLE fda_holdings ADD COLUMN updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP;`);
     }
 
+    // Ensure reward tracking columns exist on fda_holdings
+    const holdingsColumnsToAdd = [
+      { name: 'reward_rate', type: 'NUMERIC(10, 4)' },
+      { name: 'reward_amount', type: 'NUMERIC(30, 18)' },
+      { name: 'claimed_at', type: 'TIMESTAMP' },
+    ];
+    for (const column of holdingsColumnsToAdd) {
+      const check = await client.query(
+        `
+          SELECT column_name
+          FROM information_schema.columns
+          WHERE table_name = 'fda_holdings' AND column_name = $1
+        `,
+        [column.name],
+      );
+      if (check.rows.length === 0) {
+        await client.query(`ALTER TABLE fda_holdings ADD COLUMN ${column.name} ${column.type};`);
+      }
+    }
+
     // Check and add columns if they don't exist (PostgreSQL way)
     const userColumns = await client.query(`
       SELECT column_name 
@@ -572,7 +595,10 @@ export async function runMigrations() {
     // Initialize default settings if they don't exist
     const defaultSettings = [
       { key: 'p2p_fee_rate', value: '1', description: 'P2P Trading Fee Rate (percentage, e.g., 1 for 1%, 5 for 5%)' },
-      { key: 'holding_fda_amount', value: '0', description: 'Minimum FDA balance to hold (users cannot use this amount for offers or transfers, e.g., 2.5 for 2.5 FDA)' }
+      { key: 'holding_fda_amount', value: '0', description: 'Minimum FDA balance to hold (users cannot use this amount for offers or transfers, e.g., 2.5 for 2.5 FDA)' },
+      { key: 'holding_reward_rate', value: '5', description: 'FDA holding reward percentage (e.g., 5 means 5%)' },
+      { key: 'holding_reward_min_amount', value: '25', description: 'Minimum FDA amount required in one holding lot to qualify for reward' },
+      { key: 'holding_reward_period_months', value: '12', description: 'Minimum holding period in months required to earn reward' }
     ];
 
     for (const setting of defaultSettings) {

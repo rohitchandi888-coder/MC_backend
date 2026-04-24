@@ -302,6 +302,77 @@ function calculateExpirationDate(holdingPeriod) {
 
 }
 
+function parseHoldingPeriodMonths(holdingPeriod) {
+  if (!holdingPeriod) return 0;
+  const match = String(holdingPeriod).toUpperCase().trim().match(/^(\d+)M$/);
+  if (!match) return 0;
+  const months = parseInt(match[1], 10);
+  return Number.isFinite(months) && months > 0 ? months : 0;
+}
+
+async function getNumericSetting(key, defaultValue = 0) {
+  const row = await db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
+  const parsed = row ? parseFloat(row.value) : defaultValue;
+  return Number.isFinite(parsed) ? parsed : defaultValue;
+}
+
+async function evaluateHoldingRewardEligibility(userId, holding, settings) {
+  const amount = parseFloat(holding.amount || 0);
+  const rewardRate = Number.isFinite(parseFloat(holding.reward_rate))
+    ? parseFloat(holding.reward_rate)
+    : settings.rewardRate;
+  const holdingMonths = parseHoldingPeriodMonths(holding.holding_period);
+  const requiredMonths = Math.max(1, Math.floor(settings.rewardPeriodMonths));
+
+  if (holding.claimed_at) {
+    return { eligible: false, reason: 'already_claimed', rewardRate, rewardAmount: 0 };
+  }
+  if (amount < settings.rewardMinAmount) {
+    return { eligible: false, reason: 'below_minimum_amount', rewardRate, rewardAmount: 0 };
+  }
+  if (holdingMonths < requiredMonths) {
+    return { eligible: false, reason: 'insufficient_holding_period', rewardRate, rewardAmount: 0 };
+  }
+
+  const now = new Date();
+  const expiresAt = new Date(holding.expires_at);
+  if (!(expiresAt <= now)) {
+    return { eligible: false, reason: 'not_matured_yet', rewardRate, rewardAmount: 0 };
+  }
+
+  const internalTransferUsage = await db.query(
+    `
+      SELECT COUNT(*)::int AS cnt
+      FROM internal_transfers
+      WHERE from_user_id = $1
+        AND created_at >= $2
+        AND created_at <= $3
+    `,
+    [userId, holding.created_at, holding.expires_at],
+  );
+  if ((internalTransferUsage.rows[0]?.cnt || 0) > 0) {
+    return { eligible: false, reason: 'used_internal_transfer_during_hold', rewardRate, rewardAmount: 0 };
+  }
+
+  const sellOfferUsage = await db.query(
+    `
+      SELECT COUNT(*)::int AS cnt
+      FROM offers
+      WHERE maker_id = $1
+        AND type = 'SELL'
+        AND created_at >= $2
+        AND created_at <= $3
+    `,
+    [userId, holding.created_at, holding.expires_at],
+  );
+  if ((sellOfferUsage.rows[0]?.cnt || 0) > 0) {
+    return { eligible: false, reason: 'used_sell_offer_during_hold', rewardRate, rewardAmount: 0 };
+  }
+
+  const rewardAmount = Number(((amount * rewardRate) / 100).toFixed(18));
+  return { eligible: rewardAmount > 0, reason: rewardAmount > 0 ? null : 'zero_reward', rewardRate, rewardAmount };
+}
+
 
 
 // Health
@@ -5098,10 +5169,27 @@ apiRouter.get('/internal/balance', authMiddleware, async (req, res) => {
 
     
 
+    const rewardSettings = {
+      rewardRate: await getNumericSetting('holding_reward_rate', 5),
+      rewardMinAmount: await getNumericSetting('holding_reward_min_amount', 25),
+      rewardPeriodMonths: await getNumericSetting('holding_reward_period_months', 12),
+    };
+    const rewardRows = await db.query(
+      `
+        SELECT id, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount
+        FROM fda_holdings
+        WHERE user_id = $1
+      `,
+      [userId],
+    );
+    let pendingReward = 0;
+    for (const holding of rewardRows.rows) {
+      const eligibility = await evaluateHoldingRewardEligibility(userId, holding, rewardSettings);
+      if (eligibility.eligible) pendingReward += eligibility.rewardAmount;
+    }
+
     // Since balance is deducted when creating offers, the available balance
-
     // is the current balance in DB (it's already been reduced by locked amount)
-
     // The total original balance = current balance + locked amount
 
     res.json({ 
@@ -5117,8 +5205,9 @@ apiRouter.get('/internal/balance', authMiddleware, async (req, res) => {
       total: totalBalance + locked, // Total original balance
 
       holding: holdingAmount,
-
-      usable: Math.max(0, totalBalance - holdingAmount - holdingLocked) // Usable after holding requirement and holding periods
+      usable: Math.max(0, totalBalance - holdingAmount - holdingLocked), // Usable after holding requirement and holding periods
+      pendingReward: Number(pendingReward.toFixed(18)),
+      projectedTotalAfterClaim: Number((totalBalance + locked + pendingReward).toFixed(18))
 
     });
 
@@ -6176,6 +6265,244 @@ apiRouter.get('/internal/transfers', authMiddleware, async (req, res) => {
 
 
 
+apiRouter.get('/internal/holdings/reward-status', authMiddleware, async (_req, res) => {
+  try {
+    const userId = _req.user.id;
+    const rewardSettings = {
+      rewardRate: await getNumericSetting('holding_reward_rate', 5),
+      rewardMinAmount: await getNumericSetting('holding_reward_min_amount', 25),
+      rewardPeriodMonths: await getNumericSetting('holding_reward_period_months', 12),
+    };
+    const holdingsResult = await db.query(
+      `
+        SELECT id, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount
+        FROM fda_holdings
+        WHERE user_id = $1
+        ORDER BY created_at DESC
+      `,
+      [userId],
+    );
+
+    const holdings = [];
+    let pendingReward = 0;
+    for (const holding of holdingsResult.rows) {
+      const eligibility = await evaluateHoldingRewardEligibility(userId, holding, rewardSettings);
+      if (eligibility.eligible) pendingReward += eligibility.rewardAmount;
+      holdings.push({
+        id: holding.id,
+        amount: parseFloat(holding.amount),
+        holdingPeriod: holding.holding_period,
+        createdAt: holding.created_at,
+        expiresAt: holding.expires_at,
+        claimedAt: holding.claimed_at,
+        eligible: eligibility.eligible,
+        reason: eligibility.reason,
+        rewardRate: eligibility.rewardRate,
+        rewardAmount: Number(eligibility.rewardAmount.toFixed(18)),
+        projectedTotal: Number((parseFloat(holding.amount) + eligibility.rewardAmount).toFixed(18)),
+      });
+    }
+
+    res.json({
+      settings: {
+        rewardRate: rewardSettings.rewardRate,
+        rewardMinAmount: rewardSettings.rewardMinAmount,
+        rewardPeriodMonths: Math.max(1, Math.floor(rewardSettings.rewardPeriodMonths)),
+      },
+      pendingReward: Number(pendingReward.toFixed(18)),
+      holdings,
+    });
+  } catch (err) {
+    console.error('Reward status error:', err);
+    res.status(500).json({ error: 'Failed to fetch holding reward status' });
+  }
+});
+
+apiRouter.post('/internal/holdings/claim-rewards', authMiddleware, async (req, res) => {
+  const { wallet_address } = req.body || {};
+  const walletAddress = String(wallet_address || '').toLowerCase().trim();
+  if (!walletAddress) {
+    return res.status(400).json({ error: 'wallet_address is required' });
+  }
+
+  try {
+    const ownerCheck = await db.query(
+      'SELECT user_id FROM wallets WHERE LOWER(address) = $1 LIMIT 1',
+      [walletAddress],
+    );
+    if (!ownerCheck.rows[0] || ownerCheck.rows[0].user_id !== req.user.id) {
+      return res.status(403).json({ error: 'Wallet does not belong to the authenticated user' });
+    }
+
+    const userId = req.user.id;
+    const rewardSettings = {
+      rewardRate: await getNumericSetting('holding_reward_rate', 5),
+      rewardMinAmount: await getNumericSetting('holding_reward_min_amount', 25),
+      rewardPeriodMonths: await getNumericSetting('holding_reward_period_months', 12),
+    };
+    const holdingsResult = await db.query(
+      `
+        SELECT id, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount
+        FROM fda_holdings
+        WHERE user_id = $1 AND claimed_at IS NULL
+      `,
+      [userId],
+    );
+
+    const claimable = [];
+    let totalReward = 0;
+    for (const holding of holdingsResult.rows) {
+      const eligibility = await evaluateHoldingRewardEligibility(userId, holding, rewardSettings);
+      if (!eligibility.eligible) continue;
+      claimable.push({ id: holding.id, rewardRate: eligibility.rewardRate, rewardAmount: eligibility.rewardAmount });
+      totalReward += eligibility.rewardAmount;
+    }
+
+    if (totalReward <= 0) {
+      return res.status(400).json({ error: 'No eligible holding reward available to claim yet' });
+    }
+
+    const now = new Date().toISOString();
+    for (const row of claimable) {
+      await db.query(
+        `
+          UPDATE fda_holdings
+          SET reward_rate = $1, reward_amount = $2, claimed_at = $3, updated_at = $3
+          WHERE id = $4
+        `,
+        [row.rewardRate, row.rewardAmount, now, row.id],
+      );
+    }
+
+    await db.query(
+      `
+        INSERT INTO internal_balances (wallet_address, fda_balance, updated_at)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (wallet_address)
+        DO UPDATE SET fda_balance = internal_balances.fda_balance + EXCLUDED.fda_balance, updated_at = EXCLUDED.updated_at
+      `,
+      [walletAddress, totalReward, now],
+    );
+
+    res.json({
+      success: true,
+      message: `Reward claimed successfully: ${Number(totalReward.toFixed(18))} FDA`,
+      reward: Number(totalReward.toFixed(18)),
+      claimedHoldings: claimable.length,
+      walletAddress,
+    });
+  } catch (err) {
+    console.error('Claim reward error:', err);
+    res.status(500).json({ error: 'Failed to claim holding reward' });
+  }
+});
+
+apiRouter.post('/internal/holdings/start', authMiddleware, async (req, res) => {
+  const { wallet_address, amount } = req.body || {};
+  const walletAddress = String(wallet_address || '').toLowerCase().trim();
+  const amountStr = String(amount ?? '').trim();
+
+  if (!walletAddress) {
+    return res.status(400).json({ error: 'wallet_address is required' });
+  }
+  if (!/^\d+(\.\d{0,18})?$/.test(amountStr)) {
+    return res.status(400).json({ error: 'Amount must be a valid decimal with up to 18 places' });
+  }
+  const amountNum = parseFloat(amountStr);
+  if (!Number.isFinite(amountNum) || amountNum <= 0) {
+    return res.status(400).json({ error: 'Amount must be greater than zero' });
+  }
+
+  try {
+    const ownerCheck = await db.query(
+      'SELECT user_id FROM wallets WHERE LOWER(address) = $1 LIMIT 1',
+      [walletAddress],
+    );
+    if (!ownerCheck.rows[0] || ownerCheck.rows[0].user_id !== req.user.id) {
+      return res.status(403).json({ error: 'Wallet does not belong to the authenticated user' });
+    }
+
+    const userId = req.user.id;
+    const minAmount = await getNumericSetting('holding_reward_min_amount', 25);
+    const rewardRate = Math.min(10, Math.max(5, await getNumericSetting('holding_reward_rate', 5)));
+    const rewardPeriodMonths = Math.max(1, Math.floor(await getNumericSetting('holding_reward_period_months', 12)));
+    const holdingReserveAmount = await getNumericSetting('holding_fda_amount', 0);
+
+    if (amountNum < minAmount) {
+      return res.status(400).json({ error: `Minimum holding amount is ${minAmount} FDA` });
+    }
+
+    const balanceResult = await db.query(
+      'SELECT fda_balance FROM internal_balances WHERE LOWER(TRIM(wallet_address)) = LOWER(TRIM($1))',
+      [walletAddress],
+    );
+    const totalBalance = balanceResult.rows.length
+      ? balanceResult.rows.reduce((sum, row) => sum + parseFloat(row.fda_balance || 0), 0)
+      : 0;
+
+    const lockedResult = await db.query(
+      `
+        SELECT COALESCE(SUM(remaining), 0) as locked
+        FROM offers
+        WHERE maker_id = $1 AND type = 'SELL' AND status = 'OPEN' AND asset_symbol = 'FDA'
+      `,
+      [userId],
+    );
+    const locked = parseFloat(lockedResult.rows[0]?.locked || 0);
+
+    const activeHoldingResult = await db.query(
+      `
+        SELECT COALESCE(SUM(amount), 0) as holding_locked
+        FROM fda_holdings
+        WHERE user_id = $1 AND expires_at > CURRENT_TIMESTAMP
+      `,
+      [userId],
+    );
+    const activeHoldingLocked = parseFloat(activeHoldingResult.rows[0]?.holding_locked || 0);
+    const usableBalance = Math.max(0, totalBalance - locked - activeHoldingLocked - holdingReserveAmount);
+
+    if (usableBalance < amountNum) {
+      return res.status(400).json({
+        error: `Insufficient usable balance for holding start. Usable ${usableBalance.toFixed(18)} FDA, requested ${amountNum} FDA.`,
+      });
+    }
+
+    const now = new Date().toISOString();
+    const holdingPeriod = `${rewardPeriodMonths}M`;
+    const expiresAt = calculateExpirationDate(holdingPeriod);
+    const insertResult = await db.query(
+      `
+        INSERT INTO fda_holdings (user_id, amount, holding_period, expires_at, reward_rate, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $6)
+        RETURNING id, user_id, amount, holding_period, expires_at, reward_rate, created_at, claimed_at
+      `,
+      [userId, amountNum, holdingPeriod, expiresAt, rewardRate, now],
+    );
+    const holding = insertResult.rows[0];
+    const rewardAmount = Number(((amountNum * rewardRate) / 100).toFixed(18));
+
+    res.json({
+      success: true,
+      message: 'Holding started successfully',
+      holding: {
+        id: holding.id,
+        userId: holding.user_id,
+        amount: parseFloat(holding.amount),
+        holdingPeriod: holding.holding_period,
+        expiresAt: holding.expires_at,
+        rewardRate: parseFloat(holding.reward_rate),
+        estimatedReward: rewardAmount,
+        estimatedTotalAfterMaturity: Number((amountNum + rewardAmount).toFixed(18)),
+        claimedAt: holding.claimed_at,
+        createdAt: holding.created_at,
+      },
+    });
+  } catch (err) {
+    console.error('Start holding error:', err);
+    res.status(500).json({ error: 'Failed to start holding' });
+  }
+});
+
 // Settings endpoints
 
 apiRouter.get('/admin/settings', authMiddleware, adminMiddleware, async (_req, res) => {
@@ -6208,6 +6535,17 @@ apiRouter.get('/settings/holding-fda-amount', async (_req, res) => {
 
   res.json({ holdingAmount });
 
+});
+
+apiRouter.get('/settings/holding-reward', async (_req, res) => {
+  const rewardRate = await getNumericSetting('holding_reward_rate', 5);
+  const rewardMinAmount = await getNumericSetting('holding_reward_min_amount', 25);
+  const rewardPeriodMonths = await getNumericSetting('holding_reward_period_months', 12);
+  res.json({
+    rewardRate,
+    rewardMinAmount,
+    rewardPeriodMonths: Math.max(1, Math.floor(rewardPeriodMonths)),
+  });
 });
 
 
@@ -6286,6 +6624,34 @@ apiRouter.put('/admin/settings/:key', authMiddleware, adminMiddleware, async (re
 
     value = valueStr;
 
+  }
+
+  if (key === 'holding_reward_rate') {
+    const numeric = parseFloat(String(value).trim());
+    if (!Number.isFinite(numeric) || numeric < 5 || numeric > 10) {
+      return res.status(400).json({ error: 'Holding reward rate must be between 5 and 10 percent' });
+    }
+    value = String(numeric);
+  }
+
+  if (key === 'holding_reward_min_amount') {
+    const valueStr = String(value).trim();
+    if (!/^\d+(\.\d{0,18})?$/.test(valueStr)) {
+      return res.status(400).json({ error: 'Minimum holding amount must be a decimal with up to 18 places' });
+    }
+    const numeric = parseFloat(valueStr);
+    if (!Number.isFinite(numeric) || numeric < 25) {
+      return res.status(400).json({ error: 'Minimum holding amount must be at least 25 FDA' });
+    }
+    value = valueStr;
+  }
+
+  if (key === 'holding_reward_period_months') {
+    const numeric = parseInt(String(value).trim(), 10);
+    if (!Number.isFinite(numeric) || numeric <= 0) {
+      return res.status(400).json({ error: 'Holding reward period must be a positive number of months' });
+    }
+    value = String(numeric);
   }
 
 
@@ -6878,11 +7244,13 @@ apiRouter.post('/fda/transfer-to-mc-wallet', validateFDAOrigin, validateAPIKey, 
 
       console.log(`\n[FDA API] 🔒 Creating holding period record...`);
 
+      const rewardRateSetting = await getNumericSetting('holding_reward_rate', 5);
+      const rewardRateSnapshot = Math.min(10, Math.max(5, rewardRateSetting));
       const holdingStmt = db.prepare(`
 
-        INSERT INTO fda_holdings (user_id, amount, holding_period, expires_at, created_at)
+        INSERT INTO fda_holdings (user_id, amount, holding_period, expires_at, reward_rate, created_at)
 
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?)
 
       `);
 
@@ -6895,6 +7263,8 @@ apiRouter.post('/fda/transfer-to-mc-wallet', validateFDAOrigin, validateAPIKey, 
         holdingPeriod.toUpperCase(),
 
         expiresAt,
+
+        rewardRateSnapshot,
 
         now
 
