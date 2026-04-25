@@ -327,6 +327,9 @@ async function evaluateHoldingRewardEligibility(userId, holding, settings) {
   if (holding.claimed_at) {
     return { eligible: false, reason: 'already_claimed', rewardRate, rewardAmount: 0 };
   }
+  if (String(holding.break_request_status || '').toUpperCase() === 'APPROVED') {
+    return { eligible: false, reason: 'early_unlock_approved', rewardRate, rewardAmount: 0 };
+  }
   if (amount < settings.rewardMinAmount) {
     return { eligible: false, reason: 'below_minimum_amount', rewardRate, rewardAmount: 0 };
   }
@@ -369,8 +372,21 @@ async function evaluateHoldingRewardEligibility(userId, holding, settings) {
     return { eligible: false, reason: 'used_sell_offer_during_hold', rewardRate, rewardAmount: 0 };
   }
 
-  const rewardAmount = Number(((amount * rewardRate) / 100).toFixed(18));
-  return { eligible: rewardAmount > 0, reason: rewardAmount > 0 ? null : 'zero_reward', rewardRate, rewardAmount };
+  const fdaPrice = Number.isFinite(settings.fdaPrice) && settings.fdaPrice > 0 ? settings.fdaPrice : 0;
+  // Value-based reward path (as requested): amount(FDA) -> value -> reward value -> back to FDA.
+  // If price is missing/invalid, fallback to direct FDA percentage.
+  const rewardValue = fdaPrice > 0 ? (amount * fdaPrice * rewardRate) / 100 : 0;
+  const rewardAmount = Number(
+    (fdaPrice > 0 ? rewardValue / fdaPrice : (amount * rewardRate) / 100).toFixed(18),
+  );
+  return {
+    eligible: rewardAmount > 0,
+    reason: rewardAmount > 0 ? null : 'zero_reward',
+    rewardRate,
+    rewardAmount,
+    fdaPrice,
+    rewardValue: Number(rewardValue.toFixed(8)),
+  };
 }
 
 
@@ -665,31 +681,7 @@ apiRouter.post('/auth/login', async (req, res) => {
 
     
 
-    // Also try if username is numeric and matches the database id (for testing)
-
-    if (!userRow && /^\d+$/.test(username)) {
-
-      console.log(`[AUTH] 🔍 Username is numeric, checking if it matches database ID...`);
-
-      const numericId = parseInt(username, 10);
-
-      if (!isNaN(numericId)) {
-
-        userRow = await db
-
-          .prepare('SELECT id, fda_user_id, email, phone, password_hash, is_admin FROM users WHERE id = ?')
-
-          .get(numericId);
-
-        if (userRow) {
-
-          console.log(`[AUTH] ⚠️  Found user by database ID (this should not be used for login, but found for debugging)`);
-
-        }
-
-      }
-
-    }
+    // SECURITY: do not allow login by local numeric database ID.
 
     
 
@@ -702,6 +694,12 @@ apiRouter.post('/auth/login', async (req, res) => {
     if (userRow) {
 
       console.log(`[AUTH] ✅ User found locally with ID: ${userRow.id}, FDA User ID: ${userRow.fda_user_id}`);
+      if (!userRow.fda_user_id || String(userRow.fda_user_id).trim() === '') {
+        console.log(`[AUTH] ❌ Local account ${userRow.id} is not linked to FDA user ID. Blocking login.`);
+        return res.status(403).json({
+          error: 'Only FDA-linked users are allowed to login. This account is not linked to FDA.',
+        });
+      }
 
       console.log(`[AUTH] 🔍 Checking password for user: ${username}`);
 
@@ -1450,6 +1448,9 @@ apiRouter.get('/auth/profile', authMiddleware, async (req, res) => {
 
 
 
+    const fdaPriceSetting = await db.prepare('SELECT value FROM settings WHERE key = ?').get('fda_price');
+    const fdaPrice = fdaPriceSetting ? parseFloat(fdaPriceSetting.value) : null;
+
     res.json({
 
       id: row.id,
@@ -1463,6 +1464,7 @@ apiRouter.get('/auth/profile', authMiddleware, async (req, res) => {
       is_admin: !!row.is_admin,
 
       created_at: row.created_at,
+      fda_price: Number.isFinite(fdaPrice) ? fdaPrice : null,
 
     });
 
@@ -5173,10 +5175,11 @@ apiRouter.get('/internal/balance', authMiddleware, async (req, res) => {
       rewardRate: await getNumericSetting('holding_reward_rate', 5),
       rewardMinAmount: await getNumericSetting('holding_reward_min_amount', 25),
       rewardPeriodMonths: await getNumericSetting('holding_reward_period_months', 12),
+      fdaPrice: await getNumericSetting('fda_price', 0),
     };
     const rewardRows = await db.query(
       `
-        SELECT id, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount
+        SELECT id, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount, break_request_status
         FROM fda_holdings
         WHERE user_id = $1
       `,
@@ -6272,10 +6275,12 @@ apiRouter.get('/internal/holdings/reward-status', authMiddleware, async (_req, r
       rewardRate: await getNumericSetting('holding_reward_rate', 5),
       rewardMinAmount: await getNumericSetting('holding_reward_min_amount', 25),
       rewardPeriodMonths: await getNumericSetting('holding_reward_period_months', 12),
+      fdaPrice: await getNumericSetting('fda_price', 0),
     };
     const holdingsResult = await db.query(
       `
-        SELECT id, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount
+        SELECT id, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount,
+               break_request_status, break_request_note, break_requested_at, break_decided_at
         FROM fda_holdings
         WHERE user_id = $1
         ORDER BY created_at DESC
@@ -6295,9 +6300,15 @@ apiRouter.get('/internal/holdings/reward-status', authMiddleware, async (_req, r
         createdAt: holding.created_at,
         expiresAt: holding.expires_at,
         claimedAt: holding.claimed_at,
+        breakRequestStatus: holding.break_request_status || 'NONE',
+        breakRequestNote: holding.break_request_note || null,
+        breakRequestedAt: holding.break_requested_at || null,
+        breakDecidedAt: holding.break_decided_at || null,
         eligible: eligibility.eligible,
         reason: eligibility.reason,
         rewardRate: eligibility.rewardRate,
+        fdaPrice: eligibility.fdaPrice,
+        rewardValue: eligibility.rewardValue,
         rewardAmount: Number(eligibility.rewardAmount.toFixed(18)),
         projectedTotal: Number((parseFloat(holding.amount) + eligibility.rewardAmount).toFixed(18)),
       });
@@ -6308,6 +6319,7 @@ apiRouter.get('/internal/holdings/reward-status', authMiddleware, async (_req, r
         rewardRate: rewardSettings.rewardRate,
         rewardMinAmount: rewardSettings.rewardMinAmount,
         rewardPeriodMonths: Math.max(1, Math.floor(rewardSettings.rewardPeriodMonths)),
+        fdaPrice: Number.isFinite(rewardSettings.fdaPrice) ? rewardSettings.fdaPrice : 0,
       },
       pendingReward: Number(pendingReward.toFixed(18)),
       holdings,
@@ -6315,6 +6327,55 @@ apiRouter.get('/internal/holdings/reward-status', authMiddleware, async (_req, r
   } catch (err) {
     console.error('Reward status error:', err);
     res.status(500).json({ error: 'Failed to fetch holding reward status' });
+  }
+});
+
+apiRouter.post('/internal/holdings/:id/break-request', authMiddleware, async (req, res) => {
+  const holdingId = parseInt(req.params.id, 10);
+  const note = String(req.body?.note || '').trim();
+  if (!Number.isFinite(holdingId) || holdingId <= 0) {
+    return res.status(400).json({ error: 'Invalid holding id' });
+  }
+  try {
+    const holdingResult = await db.query(
+      `
+        SELECT id, user_id, claimed_at, expires_at, break_request_status
+        FROM fda_holdings
+        WHERE id = $1
+      `,
+      [holdingId],
+    );
+    const holding = holdingResult.rows[0];
+    if (!holding || holding.user_id !== req.user.id) {
+      return res.status(404).json({ error: 'Holding not found' });
+    }
+    if (holding.claimed_at) {
+      return res.status(400).json({ error: 'Cannot request break for claimed holding' });
+    }
+    if (new Date(holding.expires_at) <= new Date()) {
+      return res.status(400).json({ error: 'Holding already matured, break request not required' });
+    }
+    if (holding.break_request_status === 'PENDING') {
+      return res.status(400).json({ error: 'Break request already pending for this holding' });
+    }
+    const now = new Date().toISOString();
+    await db.query(
+      `
+        UPDATE fda_holdings
+        SET break_request_status = 'PENDING',
+            break_request_note = $1,
+            break_requested_at = $2,
+            break_decided_at = NULL,
+            break_decided_by = NULL,
+            updated_at = $2
+        WHERE id = $3
+      `,
+      [note || null, now, holdingId],
+    );
+    res.json({ success: true, message: 'Break request created and sent to admin for review.' });
+  } catch (err) {
+    console.error('Create holding break request error:', err);
+    res.status(500).json({ error: 'Failed to create break request' });
   }
 });
 
@@ -6339,10 +6400,11 @@ apiRouter.post('/internal/holdings/claim-rewards', authMiddleware, async (req, r
       rewardRate: await getNumericSetting('holding_reward_rate', 5),
       rewardMinAmount: await getNumericSetting('holding_reward_min_amount', 25),
       rewardPeriodMonths: await getNumericSetting('holding_reward_period_months', 12),
+      fdaPrice: await getNumericSetting('fda_price', 0),
     };
     const holdingsResult = await db.query(
       `
-        SELECT id, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount
+        SELECT id, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount, break_request_status
         FROM fda_holdings
         WHERE user_id = $1 AND claimed_at IS NULL
       `,
@@ -6424,8 +6486,9 @@ apiRouter.post('/internal/holdings/start', authMiddleware, async (req, res) => {
 
     const userId = req.user.id;
     const minAmount = await getNumericSetting('holding_reward_min_amount', 25);
-    const rewardRate = Math.min(10, Math.max(5, await getNumericSetting('holding_reward_rate', 5)));
+    const rewardRate = Math.max(0, await getNumericSetting('holding_reward_rate', 5));
     const rewardPeriodMonths = Math.max(1, Math.floor(await getNumericSetting('holding_reward_period_months', 12)));
+    const fdaPrice = await getNumericSetting('fda_price', 0);
     const holdingReserveAmount = await getNumericSetting('holding_fda_amount', 0);
 
     if (amountNum < minAmount) {
@@ -6479,7 +6542,10 @@ apiRouter.post('/internal/holdings/start', authMiddleware, async (req, res) => {
       [userId, amountNum, holdingPeriod, expiresAt, rewardRate, now],
     );
     const holding = insertResult.rows[0];
-    const rewardAmount = Number(((amountNum * rewardRate) / 100).toFixed(18));
+    const rewardValue = fdaPrice > 0 ? (amountNum * fdaPrice * rewardRate) / 100 : 0;
+    const rewardAmount = Number(
+      (fdaPrice > 0 ? rewardValue / fdaPrice : (amountNum * rewardRate) / 100).toFixed(18),
+    );
 
     res.json({
       success: true,
@@ -6491,6 +6557,8 @@ apiRouter.post('/internal/holdings/start', authMiddleware, async (req, res) => {
         holdingPeriod: holding.holding_period,
         expiresAt: holding.expires_at,
         rewardRate: parseFloat(holding.reward_rate),
+        fdaPrice: Number(fdaPrice || 0),
+        estimatedRewardValue: Number(rewardValue.toFixed(8)),
         estimatedReward: rewardAmount,
         estimatedTotalAfterMaturity: Number((amountNum + rewardAmount).toFixed(18)),
         claimedAt: holding.claimed_at,
@@ -6504,6 +6572,21 @@ apiRouter.post('/internal/holdings/start', authMiddleware, async (req, res) => {
 });
 
 // Settings endpoints
+
+apiRouter.get('/fdaPrice', async (_req, res) => {
+  try {
+    const setting = await db.prepare('SELECT value FROM settings WHERE key = ?').get('fda_price');
+    const price = setting ? parseFloat(setting.value) : 0;
+    res.json({
+      success: true,
+      price: Number.isFinite(price) ? price : 0,
+      data: Number.isFinite(price) ? price : 0,
+    });
+  } catch (err) {
+    console.error('Failed to fetch FDA price setting:', err);
+    res.status(500).json({ error: 'Failed to fetch FDA price' });
+  }
+});
 
 apiRouter.get('/admin/settings', authMiddleware, adminMiddleware, async (_req, res) => {
 
@@ -6628,8 +6711,8 @@ apiRouter.put('/admin/settings/:key', authMiddleware, adminMiddleware, async (re
 
   if (key === 'holding_reward_rate') {
     const numeric = parseFloat(String(value).trim());
-    if (!Number.isFinite(numeric) || numeric < 5 || numeric > 10) {
-      return res.status(400).json({ error: 'Holding reward rate must be between 5 and 10 percent' });
+    if (!Number.isFinite(numeric) || numeric < 0) {
+      return res.status(400).json({ error: 'Holding reward rate must be a non-negative number' });
     }
     value = String(numeric);
   }
@@ -6640,8 +6723,8 @@ apiRouter.put('/admin/settings/:key', authMiddleware, adminMiddleware, async (re
       return res.status(400).json({ error: 'Minimum holding amount must be a decimal with up to 18 places' });
     }
     const numeric = parseFloat(valueStr);
-    if (!Number.isFinite(numeric) || numeric < 25) {
-      return res.status(400).json({ error: 'Minimum holding amount must be at least 25 FDA' });
+    if (!Number.isFinite(numeric) || numeric < 0) {
+      return res.status(400).json({ error: 'Minimum holding amount must be a non-negative number' });
     }
     value = valueStr;
   }
@@ -7245,7 +7328,7 @@ apiRouter.post('/fda/transfer-to-mc-wallet', validateFDAOrigin, validateAPIKey, 
       console.log(`\n[FDA API] 🔒 Creating holding period record...`);
 
       const rewardRateSetting = await getNumericSetting('holding_reward_rate', 5);
-      const rewardRateSnapshot = Math.min(10, Math.max(5, rewardRateSetting));
+      const rewardRateSnapshot = Math.max(0, rewardRateSetting);
       const holdingStmt = db.prepare(`
 
         INSERT INTO fda_holdings (user_id, amount, holding_period, expires_at, reward_rate, created_at)
@@ -7660,6 +7743,103 @@ apiRouter.put('/admin/holdings/:id', authMiddleware, adminMiddleware, async (req
 
   }
 
+});
+
+apiRouter.get('/admin/holdings/break-requests', authMiddleware, adminMiddleware, async (_req, res) => {
+  try {
+    const rows = await db.query(
+      `
+        SELECT h.id, h.user_id, h.amount, h.holding_period, h.expires_at, h.created_at,
+               h.break_request_status, h.break_request_note, h.break_requested_at, h.break_decided_at,
+               u.full_name, u.email, u.phone, u.fda_user_id
+        FROM fda_holdings h
+        JOIN users u ON u.id = h.user_id
+        WHERE h.break_request_status IN ('PENDING','APPROVED','REJECTED')
+        ORDER BY h.break_requested_at DESC NULLS LAST, h.created_at DESC
+      `,
+    );
+    res.json(rows.rows.map((r) => ({
+      id: r.id,
+      userId: r.user_id,
+      user: {
+        fullName: r.full_name,
+        email: r.email,
+        phone: r.phone,
+        fdaUserId: r.fda_user_id,
+      },
+      amount: parseFloat(r.amount),
+      holdingPeriod: r.holding_period,
+      expiresAt: r.expires_at,
+      breakRequestStatus: r.break_request_status,
+      breakRequestNote: r.break_request_note,
+      breakRequestedAt: r.break_requested_at,
+      breakDecidedAt: r.break_decided_at,
+    })));
+  } catch (err) {
+    console.error('Admin get break requests error:', err);
+    res.status(500).json({ error: 'Failed to fetch break requests' });
+  }
+});
+
+apiRouter.post('/admin/holdings/:id/break-decision', authMiddleware, adminMiddleware, async (req, res) => {
+  const holdingId = parseInt(req.params.id, 10);
+  const decision = String(req.body?.decision || '').toUpperCase().trim();
+  const note = String(req.body?.note || '').trim();
+  if (!Number.isFinite(holdingId) || holdingId <= 0) {
+    return res.status(400).json({ error: 'Invalid holding id' });
+  }
+  if (!['APPROVE', 'REJECT'].includes(decision)) {
+    return res.status(400).json({ error: 'decision must be APPROVE or REJECT' });
+  }
+  try {
+    const currentResult = await db.query(
+      `
+        SELECT id, break_request_status
+        FROM fda_holdings
+        WHERE id = $1
+      `,
+      [holdingId],
+    );
+    const holding = currentResult.rows[0];
+    if (!holding) return res.status(404).json({ error: 'Holding not found' });
+    if (holding.break_request_status !== 'PENDING') {
+      return res.status(400).json({ error: 'Only pending break requests can be decided' });
+    }
+    const now = new Date().toISOString();
+    const newStatus = decision === 'APPROVE' ? 'APPROVED' : 'REJECTED';
+    if (decision === 'APPROVE') {
+      await db.query(
+        `
+          UPDATE fda_holdings
+          SET break_request_status = $1,
+              break_request_note = CASE WHEN $2 <> '' THEN $2 ELSE break_request_note END,
+              break_decided_at = $3,
+              break_decided_by = $4,
+              expires_at = $3,
+              updated_at = $3
+          WHERE id = $5
+        `,
+        [newStatus, note, now, req.user.id, holdingId],
+      );
+    } else {
+      await db.query(
+        `
+          UPDATE fda_holdings
+          SET break_request_status = $1,
+              break_request_note = CASE WHEN $2 <> '' THEN $2 ELSE break_request_note END,
+              break_decided_at = $3,
+              break_decided_by = $4,
+              updated_at = $3
+          WHERE id = $5
+        `,
+        [newStatus, note, now, req.user.id, holdingId],
+      );
+    }
+    res.json({ success: true, message: `Break request ${newStatus.toLowerCase()} successfully` });
+  } catch (err) {
+    console.error('Admin break decision error:', err);
+    res.status(500).json({ error: 'Failed to update break request' });
+  }
 });
 
 

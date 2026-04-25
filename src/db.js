@@ -546,6 +546,11 @@ export async function runMigrations() {
         reward_rate NUMERIC(10, 4),
         reward_amount NUMERIC(30, 18),
         claimed_at TIMESTAMP,
+        break_request_status VARCHAR(20) NOT NULL DEFAULT 'NONE',
+        break_request_note TEXT,
+        break_requested_at TIMESTAMP,
+        break_decided_at TIMESTAMP,
+        break_decided_by INTEGER,
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -567,6 +572,11 @@ export async function runMigrations() {
       { name: 'reward_rate', type: 'NUMERIC(10, 4)' },
       { name: 'reward_amount', type: 'NUMERIC(30, 18)' },
       { name: 'claimed_at', type: 'TIMESTAMP' },
+      { name: 'break_request_status', type: "VARCHAR(20) NOT NULL DEFAULT 'NONE'" },
+      { name: 'break_request_note', type: 'TEXT' },
+      { name: 'break_requested_at', type: 'TIMESTAMP' },
+      { name: 'break_decided_at', type: 'TIMESTAMP' },
+      { name: 'break_decided_by', type: 'INTEGER' },
     ];
     for (const column of holdingsColumnsToAdd) {
       const check = await client.query(
