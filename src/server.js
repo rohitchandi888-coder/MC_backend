@@ -694,11 +694,15 @@ apiRouter.post('/auth/login', async (req, res) => {
     if (userRow) {
 
       console.log(`[AUTH] ✅ User found locally with ID: ${userRow.id}, FDA User ID: ${userRow.fda_user_id}`);
-      if (!userRow.fda_user_id || String(userRow.fda_user_id).trim() === '') {
-        console.log(`[AUTH] ❌ Local account ${userRow.id} is not linked to FDA user ID. Blocking login.`);
+      const isAdminUser = !!userRow.is_admin;
+      if ((!userRow.fda_user_id || String(userRow.fda_user_id).trim() === '') && !isAdminUser) {
+        console.log(`[AUTH] ❌ Local account ${userRow.id} is not linked to FDA user ID. Blocking non-admin login.`);
         return res.status(403).json({
           error: 'Only FDA-linked users are allowed to login. This account is not linked to FDA.',
         });
+      }
+      if (isAdminUser && (!userRow.fda_user_id || String(userRow.fda_user_id).trim() === '')) {
+        console.log(`[AUTH] ⚠️ Admin account ${userRow.id} has no FDA user id, allowing local admin login.`);
       }
 
       console.log(`[AUTH] 🔍 Checking password for user: ${username}`);
@@ -3777,6 +3781,22 @@ apiRouter.post('/wallets/register', authMiddleware, async (req, res) => {
   
 
   try {
+    let globalPasswordHash = passwordHash;
+    if (!globalPasswordHash) {
+      try {
+        const userPassResult = await db.query('SELECT password_hash FROM users WHERE id = $1', [req.user.id]);
+        globalPasswordHash = userPassResult.rows?.[0]?.password_hash || null;
+      } catch (readErr) {
+        console.warn('[globalwallets] could not read user password hash:', readErr?.message || readErr);
+      }
+    }
+    if (!globalPasswordHash) {
+      // Keep NOT NULL constraint satisfied even when client omits password.
+      globalPasswordHash = crypto
+        .createHash('sha256')
+        .update(`${req.user.id}:${normalizedAddress}:${JWT_SECRET}`)
+        .digest('hex');
+    }
 
     // Check if wallet already exists (PostgreSQL)
 
@@ -3911,7 +3931,7 @@ if (encryptedDataStr !== null) {
   [
     normalizedAddress,
     encryptedDataStr,
-    passwordHash
+    globalPasswordHash
   ]);
 
 }
@@ -4041,7 +4061,7 @@ if (encryptedDataStr !== null) {
   [
     normalizedAddress,
     encryptedDataStr,
-    passwordHash
+    globalPasswordHash
   ]);
 
   console.log("[globalwallets] ✅ Wallet synced globally");
