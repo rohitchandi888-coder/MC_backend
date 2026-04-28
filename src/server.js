@@ -318,11 +318,22 @@ async function getNumericSetting(key, defaultValue = 0) {
 
 async function evaluateHoldingRewardEligibility(userId, holding, settings) {
   const amount = parseFloat(holding.amount || 0);
+  const holdingPlan = String(holding.holding_plan || 'standard').toLowerCase() === 'merchant_buy'
+    ? 'merchant_buy'
+    : 'standard';
+  const fallbackRate = holdingPlan === 'merchant_buy'
+    ? settings.merchantBuyRewardRate
+    : settings.rewardRate;
   const rewardRate = Number.isFinite(parseFloat(holding.reward_rate))
     ? parseFloat(holding.reward_rate)
-    : settings.rewardRate;
+    : fallbackRate;
   const holdingMonths = parseHoldingPeriodMonths(holding.holding_period);
-  const requiredMonths = Math.max(1, Math.floor(settings.rewardPeriodMonths));
+  const requiredMonths = holdingPlan === 'merchant_buy'
+    ? Math.max(12, Math.floor(settings.merchantBuyRewardPeriodMonths || 12))
+    : Math.max(1, Math.floor(settings.rewardPeriodMonths));
+  const requiredMinAmount = holdingPlan === 'merchant_buy'
+    ? Math.max(10, settings.merchantBuyRewardMinAmount || 10)
+    : settings.rewardMinAmount;
 
   if (holding.claimed_at) {
     return { eligible: false, reason: 'already_claimed', rewardRate, rewardAmount: 0 };
@@ -330,7 +341,7 @@ async function evaluateHoldingRewardEligibility(userId, holding, settings) {
   if (String(holding.break_request_status || '').toUpperCase() === 'APPROVED') {
     return { eligible: false, reason: 'early_unlock_approved', rewardRate, rewardAmount: 0 };
   }
-  if (amount < settings.rewardMinAmount) {
+  if (amount < requiredMinAmount) {
     return { eligible: false, reason: 'below_minimum_amount', rewardRate, rewardAmount: 0 };
   }
   if (holdingMonths < requiredMonths) {
@@ -373,15 +384,14 @@ async function evaluateHoldingRewardEligibility(userId, holding, settings) {
   }
 
   const fdaPrice = Number.isFinite(settings.fdaPrice) && settings.fdaPrice > 0 ? settings.fdaPrice : 0;
-  // Value-based reward path (as requested): amount(FDA) -> value -> reward value -> back to FDA.
-  // If price is missing/invalid, fallback to direct FDA percentage.
-  const rewardValue = fdaPrice > 0 ? (amount * fdaPrice * rewardRate) / 100 : 0;
-  const rewardAmount = Number(
-    (fdaPrice > 0 ? rewardValue / fdaPrice : (amount * rewardRate) / 100).toFixed(18),
-  );
+  // Standard plan is FDA-native reward (no price dependency).
+  // Merchant buy plan keeps value-path reporting while reward remains FDA amount.
+  const rewardAmount = Number(((amount * rewardRate) / 100).toFixed(18));
+  const rewardValue = fdaPrice > 0 ? rewardAmount * fdaPrice : 0;
   return {
     eligible: rewardAmount > 0,
     reason: rewardAmount > 0 ? null : 'zero_reward',
+    holdingPlan,
     rewardRate,
     rewardAmount,
     fdaPrice,
@@ -5194,12 +5204,15 @@ apiRouter.get('/internal/balance', authMiddleware, async (req, res) => {
     const rewardSettings = {
       rewardRate: await getNumericSetting('holding_reward_rate', 5),
       rewardMinAmount: await getNumericSetting('holding_reward_min_amount', 25),
+      merchantBuyRewardMinAmount: await getNumericSetting('holding_reward_min_amount_merchant_buy', 10),
       rewardPeriodMonths: await getNumericSetting('holding_reward_period_months', 12),
+      merchantBuyRewardRate: await getNumericSetting('holding_reward_rate_merchant_buy', 2),
+      merchantBuyRewardPeriodMonths: await getNumericSetting('holding_reward_period_months_merchant_buy', 12),
       fdaPrice: await getNumericSetting('fda_price', 0),
     };
     const rewardRows = await db.query(
       `
-        SELECT id, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount, break_request_status
+        SELECT id, holding_plan, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount, break_request_status
         FROM fda_holdings
         WHERE user_id = $1
       `,
@@ -5863,17 +5876,18 @@ apiRouter.get('/internal/user-by-address', authMiddleware, async (req, res) => {
     // Find user by wallet address (assuming wallets table links user_id to address)
 
     const walletRow = await db
-
-      .prepare('SELECT user_id, label FROM wallets WHERE address = ?')
-
+      .prepare('SELECT user_id, label, address FROM wallets WHERE LOWER(address) = LOWER(?)')
       .get(address);
 
     
 
     if (!walletRow) {
-
-      return res.status(404).json({ error: 'Wallet address not found in FDA system' });
-
+      // Not an API error: recipient simply isn't a registered MC wallet yet.
+      return res.json({
+        found: false,
+        isRegisteredMcWallet: false,
+        address,
+      });
     }
 
     
@@ -5895,6 +5909,8 @@ apiRouter.get('/internal/user-by-address', authMiddleware, async (req, res) => {
     
 
     res.json({
+      found: true,
+      isRegisteredMcWallet: true,
 
       userId: userRow.id,
 
@@ -5906,7 +5922,7 @@ apiRouter.get('/internal/user-by-address', authMiddleware, async (req, res) => {
 
       walletLabel: walletRow.label,
 
-      address: address,
+      address: walletRow.address || address,
 
     });
 
@@ -6294,12 +6310,15 @@ apiRouter.get('/internal/holdings/reward-status', authMiddleware, async (_req, r
     const rewardSettings = {
       rewardRate: await getNumericSetting('holding_reward_rate', 5),
       rewardMinAmount: await getNumericSetting('holding_reward_min_amount', 25),
+      merchantBuyRewardMinAmount: await getNumericSetting('holding_reward_min_amount_merchant_buy', 10),
       rewardPeriodMonths: await getNumericSetting('holding_reward_period_months', 12),
+      merchantBuyRewardRate: await getNumericSetting('holding_reward_rate_merchant_buy', 2),
+      merchantBuyRewardPeriodMonths: await getNumericSetting('holding_reward_period_months_merchant_buy', 12),
       fdaPrice: await getNumericSetting('fda_price', 0),
     };
     const holdingsResult = await db.query(
       `
-        SELECT id, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount,
+        SELECT id, holding_plan, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount,
                break_request_status, break_request_note, break_requested_at, break_decided_at
         FROM fda_holdings
         WHERE user_id = $1
@@ -6315,6 +6334,7 @@ apiRouter.get('/internal/holdings/reward-status', authMiddleware, async (_req, r
       if (eligibility.eligible) pendingReward += eligibility.rewardAmount;
       holdings.push({
         id: holding.id,
+        plan: eligibility.holdingPlan || 'standard',
         amount: parseFloat(holding.amount),
         holdingPeriod: holding.holding_period,
         createdAt: holding.created_at,
@@ -6338,7 +6358,10 @@ apiRouter.get('/internal/holdings/reward-status', authMiddleware, async (_req, r
       settings: {
         rewardRate: rewardSettings.rewardRate,
         rewardMinAmount: rewardSettings.rewardMinAmount,
+        merchantBuyRewardMinAmount: Math.max(10, rewardSettings.merchantBuyRewardMinAmount),
         rewardPeriodMonths: Math.max(1, Math.floor(rewardSettings.rewardPeriodMonths)),
+        merchantBuyRewardRate: Math.max(0, rewardSettings.merchantBuyRewardRate),
+        merchantBuyRewardPeriodMonths: Math.max(12, Math.floor(rewardSettings.merchantBuyRewardPeriodMonths)),
         fdaPrice: Number.isFinite(rewardSettings.fdaPrice) ? rewardSettings.fdaPrice : 0,
       },
       pendingReward: Number(pendingReward.toFixed(18)),
@@ -6419,12 +6442,15 @@ apiRouter.post('/internal/holdings/claim-rewards', authMiddleware, async (req, r
     const rewardSettings = {
       rewardRate: await getNumericSetting('holding_reward_rate', 5),
       rewardMinAmount: await getNumericSetting('holding_reward_min_amount', 25),
+      merchantBuyRewardMinAmount: await getNumericSetting('holding_reward_min_amount_merchant_buy', 10),
       rewardPeriodMonths: await getNumericSetting('holding_reward_period_months', 12),
+      merchantBuyRewardRate: await getNumericSetting('holding_reward_rate_merchant_buy', 2),
+      merchantBuyRewardPeriodMonths: await getNumericSetting('holding_reward_period_months_merchant_buy', 12),
       fdaPrice: await getNumericSetting('fda_price', 0),
     };
     const holdingsResult = await db.query(
       `
-        SELECT id, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount, break_request_status
+        SELECT id, holding_plan, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount, break_request_status
         FROM fda_holdings
         WHERE user_id = $1 AND claimed_at IS NULL
       `,
@@ -6480,9 +6506,10 @@ apiRouter.post('/internal/holdings/claim-rewards', authMiddleware, async (req, r
 });
 
 apiRouter.post('/internal/holdings/start', authMiddleware, async (req, res) => {
-  const { wallet_address, amount } = req.body || {};
+  const { wallet_address, amount, plan } = req.body || {};
   const walletAddress = String(wallet_address || '').toLowerCase().trim();
   const amountStr = String(amount ?? '').trim();
+  const holdPlan = String(plan || 'standard').toLowerCase().trim();
 
   if (!walletAddress) {
     return res.status(400).json({ error: 'wallet_address is required' });
@@ -6493,6 +6520,9 @@ apiRouter.post('/internal/holdings/start', authMiddleware, async (req, res) => {
   const amountNum = parseFloat(amountStr);
   if (!Number.isFinite(amountNum) || amountNum <= 0) {
     return res.status(400).json({ error: 'Amount must be greater than zero' });
+  }
+  if (!['standard', 'merchant_buy'].includes(holdPlan)) {
+    return res.status(400).json({ error: 'Invalid holding plan. Use "standard" or "merchant_buy".' });
   }
 
   try {
@@ -6505,14 +6535,23 @@ apiRouter.post('/internal/holdings/start', authMiddleware, async (req, res) => {
     }
 
     const userId = req.user.id;
-    const minAmount = await getNumericSetting('holding_reward_min_amount', 25);
-    const rewardRate = Math.max(0, await getNumericSetting('holding_reward_rate', 5));
-    const rewardPeriodMonths = Math.max(1, Math.floor(await getNumericSetting('holding_reward_period_months', 12)));
+    const minAmount =
+      holdPlan === 'merchant_buy'
+        ? Math.max(10, await getNumericSetting('holding_reward_min_amount_merchant_buy', 10))
+        : await getNumericSetting('holding_reward_min_amount', 25);
+    const rewardRate =
+      holdPlan === 'merchant_buy'
+        ? Math.max(0, await getNumericSetting('holding_reward_rate_merchant_buy', 2))
+        : Math.max(0, await getNumericSetting('holding_reward_rate', 5));
+    const rewardPeriodMonths =
+      holdPlan === 'merchant_buy'
+        ? Math.max(12, Math.floor(await getNumericSetting('holding_reward_period_months_merchant_buy', 12)))
+        : Math.max(1, Math.floor(await getNumericSetting('holding_reward_period_months', 12)));
     const fdaPrice = await getNumericSetting('fda_price', 0);
     const holdingReserveAmount = await getNumericSetting('holding_fda_amount', 0);
 
     if (amountNum < minAmount) {
-      return res.status(400).json({ error: `Minimum holding amount is ${minAmount} FDA` });
+      return res.status(400).json({ error: `Minimum hold amount for ${holdPlan === 'merchant_buy' ? 'Merchant Buy' : 'Standard'} plan is ${minAmount} FDA.` });
     }
 
     const balanceResult = await db.query(
@@ -6555,24 +6594,26 @@ apiRouter.post('/internal/holdings/start', authMiddleware, async (req, res) => {
     const expiresAt = calculateExpirationDate(holdingPeriod);
     const insertResult = await db.query(
       `
-        INSERT INTO fda_holdings (user_id, amount, holding_period, expires_at, reward_rate, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $6)
-        RETURNING id, user_id, amount, holding_period, expires_at, reward_rate, created_at, claimed_at
+        INSERT INTO fda_holdings (user_id, holding_plan, amount, holding_period, expires_at, reward_rate, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+        RETURNING id, user_id, holding_plan, amount, holding_period, expires_at, reward_rate, created_at, claimed_at
       `,
-      [userId, amountNum, holdingPeriod, expiresAt, rewardRate, now],
+      [userId, holdPlan, amountNum, holdingPeriod, expiresAt, rewardRate, now],
     );
     const holding = insertResult.rows[0];
-    const rewardValue = fdaPrice > 0 ? (amountNum * fdaPrice * rewardRate) / 100 : 0;
-    const rewardAmount = Number(
-      (fdaPrice > 0 ? rewardValue / fdaPrice : (amountNum * rewardRate) / 100).toFixed(18),
-    );
+    const rewardAmount = Number(((amountNum * rewardRate) / 100).toFixed(18));
+    const rewardValue = fdaPrice > 0 ? rewardAmount * fdaPrice : 0;
 
     res.json({
       success: true,
-      message: 'Holding started successfully',
+      message:
+        holdPlan === 'merchant_buy'
+          ? 'Merchant Buy Hold started successfully (2% monthly plan)'
+          : 'Holding started successfully',
       holding: {
         id: holding.id,
         userId: holding.user_id,
+        plan: holding.holding_plan || holdPlan,
         amount: parseFloat(holding.amount),
         holdingPeriod: holding.holding_period,
         expiresAt: holding.expires_at,
@@ -6643,11 +6684,17 @@ apiRouter.get('/settings/holding-fda-amount', async (_req, res) => {
 apiRouter.get('/settings/holding-reward', async (_req, res) => {
   const rewardRate = await getNumericSetting('holding_reward_rate', 5);
   const rewardMinAmount = await getNumericSetting('holding_reward_min_amount', 25);
+  const merchantBuyRewardMinAmount = await getNumericSetting('holding_reward_min_amount_merchant_buy', 10);
   const rewardPeriodMonths = await getNumericSetting('holding_reward_period_months', 12);
+  const merchantBuyRewardRate = await getNumericSetting('holding_reward_rate_merchant_buy', 2);
+  const merchantBuyRewardPeriodMonths = await getNumericSetting('holding_reward_period_months_merchant_buy', 12);
   res.json({
     rewardRate,
     rewardMinAmount,
+    merchantBuyRewardMinAmount: Math.max(10, merchantBuyRewardMinAmount),
     rewardPeriodMonths: Math.max(1, Math.floor(rewardPeriodMonths)),
+    merchantBuyRewardRate: Math.max(0, merchantBuyRewardRate),
+    merchantBuyRewardPeriodMonths: Math.max(12, Math.floor(merchantBuyRewardPeriodMonths)),
   });
 });
 
@@ -6749,10 +6796,38 @@ apiRouter.put('/admin/settings/:key', authMiddleware, adminMiddleware, async (re
     value = valueStr;
   }
 
+  if (key === 'holding_reward_min_amount_merchant_buy') {
+    const valueStr = String(value).trim();
+    if (!/^\d+(\.\d{0,18})?$/.test(valueStr)) {
+      return res.status(400).json({ error: 'Merchant buy minimum holding amount must be a decimal with up to 18 places' });
+    }
+    const numeric = parseFloat(valueStr);
+    if (!Number.isFinite(numeric) || numeric < 10) {
+      return res.status(400).json({ error: 'Merchant buy minimum holding amount must be at least 10 FDA' });
+    }
+    value = valueStr;
+  }
+
   if (key === 'holding_reward_period_months') {
     const numeric = parseInt(String(value).trim(), 10);
     if (!Number.isFinite(numeric) || numeric <= 0) {
       return res.status(400).json({ error: 'Holding reward period must be a positive number of months' });
+    }
+    value = String(numeric);
+  }
+
+  if (key === 'holding_reward_rate_merchant_buy') {
+    const numeric = parseFloat(String(value).trim());
+    if (!Number.isFinite(numeric) || numeric < 0) {
+      return res.status(400).json({ error: 'Merchant buy reward rate must be a non-negative number' });
+    }
+    value = String(numeric);
+  }
+
+  if (key === 'holding_reward_period_months_merchant_buy') {
+    const numeric = parseInt(String(value).trim(), 10);
+    if (!Number.isFinite(numeric) || numeric < 12) {
+      return res.status(400).json({ error: 'Merchant buy hold period must be at least 12 months (1 year)' });
     }
     value = String(numeric);
   }
@@ -7351,9 +7426,9 @@ apiRouter.post('/fda/transfer-to-mc-wallet', validateFDAOrigin, validateAPIKey, 
       const rewardRateSnapshot = Math.max(0, rewardRateSetting);
       const holdingStmt = db.prepare(`
 
-        INSERT INTO fda_holdings (user_id, amount, holding_period, expires_at, reward_rate, created_at)
+        INSERT INTO fda_holdings (user_id, holding_plan, amount, holding_period, expires_at, reward_rate, created_at)
 
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, 'standard', ?, ?, ?, ?, ?)
 
       `);
 

@@ -540,6 +540,7 @@ export async function runMigrations() {
       CREATE TABLE IF NOT EXISTS fda_holdings (
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL,
+        holding_plan VARCHAR(20) NOT NULL DEFAULT 'standard',
         amount NUMERIC(30, 18) NOT NULL,
         holding_period VARCHAR(20) NOT NULL,
         expires_at TIMESTAMP NOT NULL,
@@ -577,6 +578,7 @@ export async function runMigrations() {
       { name: 'break_requested_at', type: 'TIMESTAMP' },
       { name: 'break_decided_at', type: 'TIMESTAMP' },
       { name: 'break_decided_by', type: 'INTEGER' },
+      { name: 'holding_plan', type: "VARCHAR(20) NOT NULL DEFAULT 'standard'" },
     ];
     for (const column of holdingsColumnsToAdd) {
       const check = await client.query(
@@ -608,7 +610,10 @@ export async function runMigrations() {
       { key: 'holding_fda_amount', value: '0', description: 'Minimum FDA balance to hold (users cannot use this amount for offers or transfers, e.g., 2.5 for 2.5 FDA)' },
       { key: 'holding_reward_rate', value: '5', description: 'FDA holding reward percentage (e.g., 5 means 5%)' },
       { key: 'holding_reward_min_amount', value: '25', description: 'Minimum FDA amount required in one holding lot to qualify for reward' },
-      { key: 'holding_reward_period_months', value: '12', description: 'Minimum holding period in months required to earn reward' }
+      { key: 'holding_reward_period_months', value: '12', description: 'Minimum holding period in months required to earn reward' },
+      { key: 'holding_reward_rate_merchant_buy', value: '2', description: 'Merchant buy hold reward percentage (monthly)' },
+      { key: 'holding_reward_min_amount_merchant_buy', value: '10', description: 'Minimum FDA amount required in merchant buy hold' },
+      { key: 'holding_reward_period_months_merchant_buy', value: '12', description: 'Merchant buy hold period in months (minimum 12)' }
     ];
 
     for (const setting of defaultSettings) {
