@@ -3218,42 +3218,51 @@ apiRouter.post('/offers/:id/cancel', authMiddleware, async (req, res) => {
 
   try {
 
-    // Return locked balance if this is a SELL offer for FDA
+    // Return locked balance if this is a SELL offer for FDA.
+    // internal_balances is keyed by wallet_address in current schema.
+    let makerWalletAddress = null;
+    makerWalletAddress = offer.maker_wallet_address
+      ? String(offer.maker_wallet_address).toLowerCase().trim()
+      : null;
+    try {
+      if (!makerWalletAddress) {
+        const walletRow = await db
+          .prepare(
+            'SELECT address FROM wallets WHERE user_id = ? ORDER BY created_at DESC LIMIT 1'
+          )
+          .get(req.user.id);
+        makerWalletAddress = walletRow?.address
+          ? String(walletRow.address).toLowerCase().trim()
+          : null;
+      }
+    } catch {
+      makerWalletAddress = null;
+    }
 
     const cancel = await db.transaction(async () => {
 
       if (offer.type === 'SELL' && offer.asset_symbol === 'FDA') {
 
-        // Return the remaining amount back to the user's balance
-
+        // Return the remaining amount back to the user's internal balance.
         const now = new Date().toISOString();
 
-        let balanceRow = await db
+        if (makerWalletAddress) {
+          const balanceRow = await db
+            .prepare(
+              'SELECT fda_balance FROM internal_balances WHERE wallet_address = ?'
+            )
+            .get(makerWalletAddress);
 
-          .prepare('SELECT fda_balance FROM internal_balances WHERE user_id = ?')
-
-          .get(req.user.id);
-
-        
-
-        if (!balanceRow) {
-
-          await db.prepare('INSERT INTO internal_balances (user_id, fda_balance, updated_at) VALUES (?, ?, ?)').run(
-
-            req.user.id, offer.remaining, now
-
-          );
-
-        } else {
-
-          await db.prepare(
-
-            'UPDATE internal_balances SET fda_balance = fda_balance + ?, updated_at = ? WHERE user_id = ?'
-
-          ).run(offer.remaining, now, req.user.id);
-
+          if (!balanceRow) {
+            await db.prepare(
+              'INSERT INTO internal_balances (wallet_address, fda_balance, updated_at) VALUES (?, ?, ?)'
+            ).run(makerWalletAddress, offer.remaining, now);
+          } else {
+            await db.prepare(
+              'UPDATE internal_balances SET fda_balance = fda_balance + ?, updated_at = ? WHERE wallet_address = ?'
+            ).run(offer.remaining, now, makerWalletAddress);
+          }
         }
-
       }
 
       
