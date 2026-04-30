@@ -608,10 +608,28 @@ export async function runMigrations() {
       await client.query(`ALTER TABLE users ADD COLUMN full_name VARCHAR(255);`);
     }
 
+    // Migrate legacy key to new key if needed.
+    const hasNewMinPriceKey = await client.query('SELECT 1 FROM settings WHERE key = $1 LIMIT 1', ['p2p_min_price_per_fda']);
+    const hasOldMinOfferKey = await client.query('SELECT 1 FROM settings WHERE key = $1 LIMIT 1', ['p2p_min_offer_amount']);
+    if (hasOldMinOfferKey.rows.length > 0 && hasNewMinPriceKey.rows.length === 0) {
+      await client.query(
+        `UPDATE settings
+         SET key = $1,
+             description = $2,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE key = $3`,
+        [
+          'p2p_min_price_per_fda',
+          'Minimum price per FDA required to create a P2P offer (applies to both BUY and SELL)',
+          'p2p_min_offer_amount',
+        ],
+      );
+    }
+
     // Initialize default settings if they don't exist
     const defaultSettings = [
       { key: 'p2p_fee_rate', value: '1', description: 'P2P Trading Fee Rate (percentage, e.g., 1 for 1%, 5 for 5%)' },
-      { key: 'p2p_min_offer_amount', value: '1', description: 'Minimum FDA amount required to create a P2P offer (applies to both BUY and SELL)' },
+      { key: 'p2p_min_price_per_fda', value: '1', description: 'Minimum price per FDA required to create a P2P offer (applies to both BUY and SELL)' },
       { key: 'holding_fda_amount', value: '0', description: 'Minimum FDA balance to hold (users cannot use this amount for offers or transfers, e.g., 2.5 for 2.5 FDA)' },
       { key: 'holding_reward_rate', value: '5', description: 'FDA holding reward percentage (e.g., 5 means 5%)' },
       { key: 'holding_reward_min_amount', value: '25', description: 'Minimum FDA amount required in one holding lot to qualify for reward' },

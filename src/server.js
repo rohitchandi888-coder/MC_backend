@@ -316,6 +316,13 @@ async function getNumericSetting(key, defaultValue = 0) {
   return Number.isFinite(parsed) ? parsed : defaultValue;
 }
 
+async function getP2PMinPricePerFda(defaultValue = 1) {
+  const preferred = await getNumericSetting('p2p_min_price_per_fda', Number.NaN);
+  if (Number.isFinite(preferred) && preferred > 0) return preferred;
+  const legacy = await getNumericSetting('p2p_min_offer_amount', defaultValue);
+  return Number.isFinite(legacy) && legacy > 0 ? legacy : defaultValue;
+}
+
 async function evaluateHoldingRewardEligibility(userId, holding, settings) {
   const amount = parseFloat(holding.amount || 0);
   const holdingPlan = String(holding.holding_plan || 'standard').toLowerCase() === 'merchant_buy'
@@ -1866,14 +1873,18 @@ console.log("this is requestbody", req.body);
   if (!Number.isFinite(amountNum) || amountNum <= 0) {
     return res.status(400).json({ error: 'Amount must be a valid number greater than 0' });
   }
+  const priceNum = Number(price);
+  if (!Number.isFinite(priceNum) || priceNum <= 0) {
+    return res.status(400).json({ error: 'Price must be a valid number greater than 0' });
+  }
 
 
 
   try {
-    const minOfferAmount = Math.max(0, await getNumericSetting('p2p_min_offer_amount', 1));
-    if (amountNum < minOfferAmount) {
+    const minOfferAmount = Math.max(0, await getP2PMinPricePerFda(1));
+    if (priceNum < minOfferAmount) {
       return res.status(400).json({
-        error: `Minimum offer amount is ${minOfferAmount} FDA for both BUY and SELL offers.`,
+        error: `Minimum price per FDA is ${minOfferAmount} for both BUY and SELL offers.`,
       });
     }
 
@@ -6756,12 +6767,18 @@ apiRouter.get('/settings/holding-fda-amount', async (_req, res) => {
 
 });
 
+apiRouter.get('/settings/min-price-per-fda', async (_req, res) => {
+
+  const minPricePerFda = await getP2PMinPricePerFda(1);
+
+  res.json({ minPricePerFda, minOfferAmount: minPricePerFda });
+
+});
+
 apiRouter.get('/settings/min-offer-amount', async (_req, res) => {
-
-  const minOfferAmount = await getNumericSetting('p2p_min_offer_amount', 1);
-
-  res.json({ minOfferAmount });
-
+  const minPricePerFda = await getP2PMinPricePerFda(1);
+  // Legacy endpoint kept for backward compatibility.
+  res.json({ minOfferAmount: minPricePerFda, minPricePerFda });
 });
 
 apiRouter.get('/settings/holding-reward', async (_req, res) => {
@@ -6786,6 +6803,7 @@ apiRouter.get('/settings/holding-reward', async (_req, res) => {
 apiRouter.put('/admin/settings/:key', authMiddleware, adminMiddleware, async (req, res) => {
 
   const { key } = req.params;
+  const normalizedKey = key === 'p2p_min_offer_amount' ? 'p2p_min_price_per_fda' : key;
 
   let { value, description } = req.body;
 
@@ -6803,7 +6821,7 @@ apiRouter.put('/admin/settings/:key', authMiddleware, adminMiddleware, async (re
 
   // Validate fee rate if it's the p2p_fee_rate setting
 
-  if (key === 'p2p_fee_rate') {
+  if (normalizedKey === 'p2p_fee_rate') {
 
     const feeRate = parseFloat(value);
 
@@ -6819,13 +6837,13 @@ apiRouter.put('/admin/settings/:key', authMiddleware, adminMiddleware, async (re
 
   }
 
-  if (key === 'p2p_min_offer_amount') {
+  if (normalizedKey === 'p2p_min_price_per_fda') {
 
     const valueStr = String(value).trim();
 
     if (!/^\d+(\.\d{0,18})?$/.test(valueStr)) {
 
-      return res.status(400).json({ error: 'Minimum offer amount must be a decimal with up to 18 places' });
+      return res.status(400).json({ error: 'Minimum price per FDA must be a decimal with up to 18 places' });
 
     }
 
@@ -6833,7 +6851,7 @@ apiRouter.put('/admin/settings/:key', authMiddleware, adminMiddleware, async (re
 
     if (!Number.isFinite(numeric) || numeric <= 0) {
 
-      return res.status(400).json({ error: 'Minimum offer amount must be greater than 0' });
+      return res.status(400).json({ error: 'Minimum price per FDA must be greater than 0' });
 
     }
 
@@ -6845,7 +6863,7 @@ apiRouter.put('/admin/settings/:key', authMiddleware, adminMiddleware, async (re
 
   // Validate holding FDA amount if it's the holding_fda_amount setting
 
-  if (key === 'holding_fda_amount') {
+  if (normalizedKey === 'holding_fda_amount') {
 
     const valueStr = String(value).trim();
 
@@ -6881,7 +6899,7 @@ apiRouter.put('/admin/settings/:key', authMiddleware, adminMiddleware, async (re
 
   }
 
-  if (key === 'holding_reward_rate') {
+  if (normalizedKey === 'holding_reward_rate') {
     const numeric = parseFloat(String(value).trim());
     if (!Number.isFinite(numeric) || numeric < 0) {
       return res.status(400).json({ error: 'Holding reward rate must be a non-negative number' });
@@ -6889,7 +6907,7 @@ apiRouter.put('/admin/settings/:key', authMiddleware, adminMiddleware, async (re
     value = String(numeric);
   }
 
-  if (key === 'holding_reward_min_amount') {
+  if (normalizedKey === 'holding_reward_min_amount') {
     const valueStr = String(value).trim();
     if (!/^\d+(\.\d{0,18})?$/.test(valueStr)) {
       return res.status(400).json({ error: 'Minimum holding amount must be a decimal with up to 18 places' });
@@ -6901,7 +6919,7 @@ apiRouter.put('/admin/settings/:key', authMiddleware, adminMiddleware, async (re
     value = valueStr;
   }
 
-  if (key === 'holding_reward_min_amount_merchant_buy') {
+  if (normalizedKey === 'holding_reward_min_amount_merchant_buy') {
     const valueStr = String(value).trim();
     if (!/^\d+(\.\d{0,18})?$/.test(valueStr)) {
       return res.status(400).json({ error: 'Merchant buy minimum holding amount must be a decimal with up to 18 places' });
@@ -6913,7 +6931,7 @@ apiRouter.put('/admin/settings/:key', authMiddleware, adminMiddleware, async (re
     value = valueStr;
   }
 
-  if (key === 'holding_reward_period_months') {
+  if (normalizedKey === 'holding_reward_period_months') {
     const numeric = parseInt(String(value).trim(), 10);
     if (!Number.isFinite(numeric) || numeric <= 0) {
       return res.status(400).json({ error: 'Holding reward period must be a positive number of months' });
@@ -6921,7 +6939,7 @@ apiRouter.put('/admin/settings/:key', authMiddleware, adminMiddleware, async (re
     value = String(numeric);
   }
 
-  if (key === 'holding_reward_rate_merchant_buy') {
+  if (normalizedKey === 'holding_reward_rate_merchant_buy') {
     const numeric = parseFloat(String(value).trim());
     if (!Number.isFinite(numeric) || numeric < 0) {
       return res.status(400).json({ error: 'Merchant buy reward rate must be a non-negative number' });
@@ -6929,7 +6947,7 @@ apiRouter.put('/admin/settings/:key', authMiddleware, adminMiddleware, async (re
     value = String(numeric);
   }
 
-  if (key === 'holding_reward_period_months_merchant_buy') {
+  if (normalizedKey === 'holding_reward_period_months_merchant_buy') {
     const numeric = parseInt(String(value).trim(), 10);
     if (!Number.isFinite(numeric) || numeric < 12) {
       return res.status(400).json({ error: 'Merchant buy hold period must be at least 12 months (1 year)' });
@@ -6943,7 +6961,7 @@ apiRouter.put('/admin/settings/:key', authMiddleware, adminMiddleware, async (re
 
     const now = new Date().toISOString();
 
-    const existing = await db.prepare('SELECT * FROM settings WHERE key = ?').get(key);
+    const existing = await db.prepare('SELECT * FROM settings WHERE key = ?').get(normalizedKey);
 
     
 
@@ -6957,7 +6975,7 @@ apiRouter.put('/admin/settings/:key', authMiddleware, adminMiddleware, async (re
 
         now,
 
-        key
+        normalizedKey
 
       );
 
@@ -6965,7 +6983,7 @@ apiRouter.put('/admin/settings/:key', authMiddleware, adminMiddleware, async (re
 
       await db.prepare('INSERT INTO settings (key, value, description, updated_at) VALUES (?, ?, ?, ?)').run(
 
-        key,
+        normalizedKey,
 
         value,
 
@@ -6979,7 +6997,7 @@ apiRouter.put('/admin/settings/:key', authMiddleware, adminMiddleware, async (re
 
 
 
-    const updated = await db.prepare('SELECT * FROM settings WHERE key = ?').get(key);
+    const updated = await db.prepare('SELECT * FROM settings WHERE key = ?').get(normalizedKey);
 
     res.json(updated);
 
