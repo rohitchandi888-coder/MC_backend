@@ -383,18 +383,27 @@ async function evaluateHoldingRewardEligibility(userId, holding, settings) {
     return { eligible: false, reason: 'used_sell_offer_during_hold', rewardRate, rewardAmount: 0 };
   }
 
-  const fdaPrice = Number.isFinite(settings.fdaPrice) && settings.fdaPrice > 0 ? settings.fdaPrice : 0;
-  // Standard plan is FDA-native reward (no price dependency).
-  // Merchant buy plan keeps value-path reporting while reward remains FDA amount.
-  const rewardAmount = Number(((amount * rewardRate) / 100).toFixed(18));
-  const rewardValue = fdaPrice > 0 ? rewardAmount * fdaPrice : 0;
+  const currentFdaPrice = Number.isFinite(settings.fdaPrice) && settings.fdaPrice > 0 ? settings.fdaPrice : 0;
+  const baseFdaPrice = Number.isFinite(parseFloat(holding.base_fda_price)) && parseFloat(holding.base_fda_price) > 0
+    ? parseFloat(holding.base_fda_price)
+    : currentFdaPrice;
+  const lockedRewardValue = Number.isFinite(parseFloat(holding.reward_value_locked)) && parseFloat(holding.reward_value_locked) > 0
+    ? parseFloat(holding.reward_value_locked)
+    : (baseFdaPrice > 0 ? (amount * baseFdaPrice * rewardRate) / 100 : 0);
+  const fallbackRewardAmount = Number(((amount * rewardRate) / 100).toFixed(18));
+  const rewardAmount = lockedRewardValue > 0 && currentFdaPrice > 0
+    ? Number((lockedRewardValue / currentFdaPrice).toFixed(18))
+    : fallbackRewardAmount;
+  const rewardValue = lockedRewardValue > 0
+    ? lockedRewardValue
+    : (currentFdaPrice > 0 ? rewardAmount * currentFdaPrice : 0);
   return {
     eligible: rewardAmount > 0,
     reason: rewardAmount > 0 ? null : 'zero_reward',
     holdingPlan,
     rewardRate,
     rewardAmount,
-    fdaPrice,
+    fdaPrice: currentFdaPrice,
     rewardValue: Number(rewardValue.toFixed(8)),
   };
 }
@@ -1698,9 +1707,53 @@ apiRouter.get('/offers', authMiddleware, async (req, res) => {
 
     .all();
 
-  res.json(
+  const offers = rows.map((o) => {
+    const allSellerMethods = db
+      .prepare(
+        `SELECT id, paymentname, upi_id, qr_code, is_active
+         FROM payment_methods
+         WHERE user_id = ?`
+      )
+      .all(o.maker_id);
 
-    rows.map((o) => ({
+    const rawMethods = String(o.payment_methods || '').trim();
+    const selectedTokens = rawMethods
+      ? rawMethods.split(',').map((m) => String(m || '').trim()).filter(Boolean)
+      : [];
+
+    const sellerPaymentMethods = selectedTokens.map((token) => {
+      const qrMatch = token.match(/^QR:(\d+)$/i);
+      if (qrMatch) {
+        const pmId = Number(qrMatch[1]);
+        const found = allSellerMethods.find((pm) => Number(pm.id) === pmId);
+        if (found) {
+          return {
+            id: found.id,
+            paymentname: found.paymentname || `QR:${found.id}`,
+            upi_id: found.upi_id || null,
+            qr_code: found.qr_code || null,
+          };
+        }
+        return { id: pmId, paymentname: token, upi_id: null, qr_code: null };
+      }
+
+      const found = allSellerMethods.find(
+        (pm) =>
+          String(pm.upi_id || '').trim().toLowerCase() === token.toLowerCase() ||
+          String(pm.paymentname || '').trim().toLowerCase() === token.toLowerCase()
+      );
+      if (found) {
+        return {
+          id: found.id,
+          paymentname: found.paymentname || found.upi_id || token,
+          upi_id: found.upi_id || token,
+          qr_code: found.qr_code || null,
+        };
+      }
+      return { id: null, paymentname: token, upi_id: token, qr_code: null };
+    });
+
+    return {
 
       id: o.id,
 
@@ -1721,6 +1774,7 @@ apiRouter.get('/offers', authMiddleware, async (req, res) => {
       maxLimit: o.max_limit ? parseFloat(o.max_limit) : null,
 
       paymentMethods: o.payment_methods,
+      sellerPaymentMethods: sellerPaymentMethods,
 
       status: o.status,
 
@@ -1735,10 +1789,10 @@ apiRouter.get('/offers', authMiddleware, async (req, res) => {
         phone: o.maker_phone,
 
       },
+    };
+  });
 
-    })),
-
-  );
+  res.json(offers);
 
 });
 
@@ -1808,9 +1862,20 @@ console.log("this is requestbody", req.body);
 
   }
 
+  const amountNum = Number(amount);
+  if (!Number.isFinite(amountNum) || amountNum <= 0) {
+    return res.status(400).json({ error: 'Amount must be a valid number greater than 0' });
+  }
+
 
 
   try {
+    const minOfferAmount = Math.max(0, await getNumericSetting('p2p_min_offer_amount', 1));
+    if (amountNum < minOfferAmount) {
+      return res.status(400).json({
+        error: `Minimum offer amount is ${minOfferAmount} FDA for both BUY and SELL offers.`,
+      });
+    }
 
     // CRITICAL: Only check balance for SELL offers, NEVER for BUY offers
 
@@ -1949,8 +2014,6 @@ console.log("this is requestbody", req.body);
       const holdingAmount = holdingSettingResult.rows[0] ? parseFloat(holdingSettingResult.rows[0].value) : 0;
 
       
-
-      const amountNum = Number(amount);
 
       const usableBalance = available - holdingAmount - holdingLocked;
 
@@ -5221,7 +5284,7 @@ apiRouter.get('/internal/balance', authMiddleware, async (req, res) => {
     };
     const rewardRows = await db.query(
       `
-        SELECT id, holding_plan, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount, break_request_status
+        SELECT id, holding_plan, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount, base_fda_price, reward_value_locked, break_request_status
         FROM fda_holdings
         WHERE user_id = $1
       `,
@@ -6327,7 +6390,7 @@ apiRouter.get('/internal/holdings/reward-status', authMiddleware, async (_req, r
     };
     const holdingsResult = await db.query(
       `
-        SELECT id, holding_plan, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount,
+        SELECT id, holding_plan, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount, base_fda_price, reward_value_locked,
                break_request_status, break_request_note, break_requested_at, break_decided_at
         FROM fda_holdings
         WHERE user_id = $1
@@ -6459,7 +6522,7 @@ apiRouter.post('/internal/holdings/claim-rewards', authMiddleware, async (req, r
     };
     const holdingsResult = await db.query(
       `
-        SELECT id, holding_plan, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount, break_request_status
+        SELECT id, holding_plan, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount, base_fda_price, reward_value_locked, break_request_status
         FROM fda_holdings
         WHERE user_id = $1 AND claimed_at IS NULL
       `,
@@ -6601,17 +6664,20 @@ apiRouter.post('/internal/holdings/start', authMiddleware, async (req, res) => {
     const now = new Date().toISOString();
     const holdingPeriod = `${rewardPeriodMonths}M`;
     const expiresAt = calculateExpirationDate(holdingPeriod);
+    const lockedRewardValue = fdaPrice > 0 ? Number(((amountNum * fdaPrice * rewardRate) / 100).toFixed(8)) : 0;
     const insertResult = await db.query(
       `
-        INSERT INTO fda_holdings (user_id, holding_plan, amount, holding_period, expires_at, reward_rate, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
-        RETURNING id, user_id, holding_plan, amount, holding_period, expires_at, reward_rate, created_at, claimed_at
+        INSERT INTO fda_holdings (user_id, holding_plan, amount, holding_period, expires_at, reward_rate, base_fda_price, reward_value_locked, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
+        RETURNING id, user_id, holding_plan, amount, holding_period, expires_at, reward_rate, base_fda_price, reward_value_locked, created_at, claimed_at
       `,
-      [userId, holdPlan, amountNum, holdingPeriod, expiresAt, rewardRate, now],
+      [userId, holdPlan, amountNum, holdingPeriod, expiresAt, rewardRate, fdaPrice > 0 ? fdaPrice : null, lockedRewardValue > 0 ? lockedRewardValue : null, now],
     );
     const holding = insertResult.rows[0];
-    const rewardAmount = Number(((amountNum * rewardRate) / 100).toFixed(18));
-    const rewardValue = fdaPrice > 0 ? rewardAmount * fdaPrice : 0;
+    const rewardAmount = fdaPrice > 0
+      ? Number((lockedRewardValue / fdaPrice).toFixed(18))
+      : Number(((amountNum * rewardRate) / 100).toFixed(18));
+    const rewardValue = lockedRewardValue > 0 ? lockedRewardValue : (fdaPrice > 0 ? rewardAmount * fdaPrice : 0);
 
     res.json({
       success: true,
@@ -6690,6 +6756,14 @@ apiRouter.get('/settings/holding-fda-amount', async (_req, res) => {
 
 });
 
+apiRouter.get('/settings/min-offer-amount', async (_req, res) => {
+
+  const minOfferAmount = await getNumericSetting('p2p_min_offer_amount', 1);
+
+  res.json({ minOfferAmount });
+
+});
+
 apiRouter.get('/settings/holding-reward', async (_req, res) => {
   const rewardRate = await getNumericSetting('holding_reward_rate', 5);
   const rewardMinAmount = await getNumericSetting('holding_reward_min_amount', 25);
@@ -6742,6 +6816,28 @@ apiRouter.put('/admin/settings/:key', authMiddleware, adminMiddleware, async (re
     // Ensure value is stored as string (including "0")
 
     value = String(feeRate);
+
+  }
+
+  if (key === 'p2p_min_offer_amount') {
+
+    const valueStr = String(value).trim();
+
+    if (!/^\d+(\.\d{0,18})?$/.test(valueStr)) {
+
+      return res.status(400).json({ error: 'Minimum offer amount must be a decimal with up to 18 places' });
+
+    }
+
+    const numeric = parseFloat(valueStr);
+
+    if (!Number.isFinite(numeric) || numeric <= 0) {
+
+      return res.status(400).json({ error: 'Minimum offer amount must be greater than 0' });
+
+    }
+
+    value = valueStr;
 
   }
 

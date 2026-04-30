@@ -545,6 +545,8 @@ export async function runMigrations() {
         holding_period VARCHAR(20) NOT NULL,
         expires_at TIMESTAMP NOT NULL,
         reward_rate NUMERIC(10, 4),
+        base_fda_price NUMERIC(30, 8),
+        reward_value_locked NUMERIC(30, 8),
         reward_amount NUMERIC(30, 18),
         claimed_at TIMESTAMP,
         break_request_status VARCHAR(20) NOT NULL DEFAULT 'NONE',
@@ -571,6 +573,8 @@ export async function runMigrations() {
     // Ensure reward tracking columns exist on fda_holdings
     const holdingsColumnsToAdd = [
       { name: 'reward_rate', type: 'NUMERIC(10, 4)' },
+      { name: 'base_fda_price', type: 'NUMERIC(30, 8)' },
+      { name: 'reward_value_locked', type: 'NUMERIC(30, 8)' },
       { name: 'reward_amount', type: 'NUMERIC(30, 18)' },
       { name: 'claimed_at', type: 'TIMESTAMP' },
       { name: 'break_request_status', type: "VARCHAR(20) NOT NULL DEFAULT 'NONE'" },
@@ -607,6 +611,7 @@ export async function runMigrations() {
     // Initialize default settings if they don't exist
     const defaultSettings = [
       { key: 'p2p_fee_rate', value: '1', description: 'P2P Trading Fee Rate (percentage, e.g., 1 for 1%, 5 for 5%)' },
+      { key: 'p2p_min_offer_amount', value: '1', description: 'Minimum FDA amount required to create a P2P offer (applies to both BUY and SELL)' },
       { key: 'holding_fda_amount', value: '0', description: 'Minimum FDA balance to hold (users cannot use this amount for offers or transfers, e.g., 2.5 for 2.5 FDA)' },
       { key: 'holding_reward_rate', value: '5', description: 'FDA holding reward percentage (e.g., 5 means 5%)' },
       { key: 'holding_reward_min_amount', value: '25', description: 'Minimum FDA amount required in one holding lot to qualify for reward' },
