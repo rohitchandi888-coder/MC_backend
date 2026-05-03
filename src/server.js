@@ -1695,7 +1695,7 @@ apiRouter.put('/auth/change-password', authMiddleware, async (req, res) => {
 // Offers
 
 apiRouter.get('/offers', authMiddleware, async (req, res) => {
-
+  try {
   const rows = await db
 
     .prepare(
@@ -1704,7 +1704,7 @@ apiRouter.get('/offers', authMiddleware, async (req, res) => {
 
        FROM offers o
 
-       JOIN users u ON u.id = o.maker_id
+       LEFT JOIN users u ON u.id = o.maker_id
 
        WHERE o.status = 'OPEN'
 
@@ -1714,14 +1714,27 @@ apiRouter.get('/offers', authMiddleware, async (req, res) => {
 
     .all();
 
+  // prepare().all() is async — never call it inside synchronous Array.map without await
+  const makerIds = [...new Set((rows || []).map((r) => r.maker_id))].filter(
+    (id) => id != null,
+  );
+  const methodsByMaker = new Map();
+  if (makerIds.length > 0) {
+    const pmResult = await db.query(
+      `SELECT id, paymentname, upi_id, qr_code, is_active, user_id
+       FROM payment_methods
+       WHERE user_id = ANY($1::int[])`,
+      [makerIds],
+    );
+    for (const pm of pmResult.rows || []) {
+      const uid = pm.user_id;
+      if (!methodsByMaker.has(uid)) methodsByMaker.set(uid, []);
+      methodsByMaker.get(uid).push(pm);
+    }
+  }
+
   const offers = rows.map((o) => {
-    const allSellerMethods = db
-      .prepare(
-        `SELECT id, paymentname, upi_id, qr_code, is_active
-         FROM payment_methods
-         WHERE user_id = ?`
-      )
-      .all(o.maker_id);
+    const allSellerMethods = methodsByMaker.get(o.maker_id) || [];
 
     const rawMethods = String(o.payment_methods || '').trim();
     const selectedTokens = rawMethods
@@ -1800,7 +1813,10 @@ apiRouter.get('/offers', authMiddleware, async (req, res) => {
   });
 
   res.json(offers);
-
+  } catch (err) {
+    console.error('GET /offers failed:', err);
+    res.status(500).json({ error: 'Failed to load offers' });
+  }
 });
 
 
@@ -2076,8 +2092,8 @@ console.log("this is requestbody", req.body);
 
           const stmt = db.prepare(
             `INSERT INTO offers 
-            (maker_id, maker_wallet_address, type, asset_symbol, fiat_currency, price, amount, remaining, min_limit, max_limit, payment_methods)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            (maker_id, maker_wallet_address, type, asset_symbol, fiat_currency, price, amount, remaining, min_limit, max_limit, payment_methods, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')`
           );
 
     const info = await stmt.run(
