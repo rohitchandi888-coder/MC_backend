@@ -3141,16 +3141,26 @@ apiRouter.post('/trades/:id/release', authMiddleware, async (req, res) => {
         buyerAddress
       );
 
+      const sellerWalletRow = await db
+        .prepare('SELECT address FROM wallets WHERE user_id = ? ORDER BY id ASC LIMIT 1')
+        .get(trade.seller_id);
+      const sellerAddr = sellerWalletRow?.address
+        ? String(sellerWalletRow.address).toLowerCase()
+        : null;
+      const buyerAddrLower = String(buyerAddress).toLowerCase();
+
       // transfer log
       await db.prepare(`
         INSERT INTO internal_transfers
-        (from_user_id,to_user_id,amount,note)
-        VALUES(?,?,?,?)
+        (from_user_id,to_user_id,amount,note,from_wallet_address,to_wallet_address)
+        VALUES(?,?,?,?,?,?)
       `).run(
         trade.seller_id,
         trade.buyer_id,
         amountToBuyer,
-        `Trade #${tradeId} release to wallet ${buyerAddress}`
+        `Trade #${tradeId} release to wallet ${buyerAddress}`,
+        sellerAddr,
+        buyerAddrLower
       );
 
       // update trade
@@ -6265,9 +6275,10 @@ apiRouter.post('/internal/transfer', authMiddleware, async (req, res) => {
 
     const transferResult = await db.query(
 
-      'INSERT INTO internal_transfers (from_user_id, to_user_id, amount, note) VALUES ($1, $2, $3, $4) RETURNING *',
+      `INSERT INTO internal_transfers (from_user_id, to_user_id, amount, note, from_wallet_address, to_wallet_address)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
 
-      [req.user.id, toUserId, amount, note || null]
+      [req.user.id, toUserId, amount, note || null, fromWalletAddress, toWalletAddress]
 
     );
 
@@ -6321,21 +6332,13 @@ apiRouter.get('/internal/transfers', authMiddleware, async (req, res) => {
 
           to_user.phone as to_phone,
 
-          to_user.fda_user_id as to_fda_user_id,
-
-          from_wallet.address as from_address,
-
-          to_wallet.address as to_address
+          to_user.fda_user_id as to_fda_user_id
 
          FROM internal_transfers it
 
          JOIN users from_user ON from_user.id = it.from_user_id
 
          JOIN users to_user ON to_user.id = it.to_user_id
-
-         LEFT JOIN wallets from_wallet ON from_wallet.user_id = it.from_user_id
-
-         LEFT JOIN wallets to_wallet ON to_wallet.user_id = it.to_user_id
 
          WHERE it.from_user_id = ? OR it.to_user_id = ?
 
@@ -6355,33 +6358,47 @@ apiRouter.get('/internal/transfers', authMiddleware, async (req, res) => {
 
     const processedRows = await Promise.all(rows.map(async (row) => {
 
-      // Get first wallet for from_user
+      // Prefer exact wallets stored on the row (required when one user has multiple wallets — same user_id for from/to).
 
-      const fromWallet = await db
+      const storedFrom = row.from_wallet_address;
 
-        .prepare('SELECT address FROM wallets WHERE user_id = ? LIMIT 1')
+      const storedTo = row.to_wallet_address;
 
-        .get(row.from_user_id);
+      const fromWallet = storedFrom
+
+        ? null
+
+        : await db
+
+            .prepare('SELECT address FROM wallets WHERE user_id = ? ORDER BY id ASC LIMIT 1')
+
+            .get(row.from_user_id);
+
+      
+
+      const toWallet = storedTo
+
+        ? null
+
+        : await db
+
+            .prepare('SELECT address FROM wallets WHERE user_id = ? ORDER BY id ASC LIMIT 1')
+
+            .get(row.to_user_id);
 
       
 
-      // Get first wallet for to_user
+      const fromFinal = storedFrom || fromWallet?.address || null;
 
-      const toWallet = await db
-
-        .prepare('SELECT address FROM wallets WHERE user_id = ? LIMIT 1')
-
-        .get(row.to_user_id);
-
-      
+      const toFinal = storedTo || toWallet?.address || null;
 
       return {
 
         ...row,
 
-        from_address: fromWallet?.address || null,
+        from_address: fromFinal ? String(fromFinal).toLowerCase() : null,
 
-        to_address: toWallet?.address || null,
+        to_address: toFinal ? String(toFinal).toLowerCase() : null,
 
       };
 
@@ -8428,13 +8445,15 @@ apiRouter.post(
 
         await db.query(`
           INSERT INTO internal_transfers
-          (from_user_id,to_user_id,amount,note)
-          VALUES($1,$2,$3,$4)
+          (from_user_id,to_user_id,amount,note,from_wallet_address,to_wallet_address)
+          VALUES($1,$2,$3,$4,$5,$6)
         `, [
           trade.seller_id,
           trade.buyer_id,
           amountToBuyer,
-          `dispute release for trade #${trade.id}`
+          `dispute release for trade #${trade.id}`,
+          sellerAddress,
+          buyerAddress,
         ]);
 
         await db.query(`
@@ -8476,13 +8495,15 @@ apiRouter.post(
 
         await db.query(`
           INSERT INTO internal_transfers
-          (from_user_id,to_user_id,amount,note)
-          VALUES($1,$2,$3,$4)
+          (from_user_id,to_user_id,amount,note,from_wallet_address,to_wallet_address)
+          VALUES($1,$2,$3,$4,$5,$6)
         `, [
           trade.seller_id,
           trade.seller_id,
           amount,
-          `refund for trade #${trade.id}`
+          `refund for trade #${trade.id}`,
+          null,
+          sellerAddress,
         ]);
 
         await db.query(`
@@ -8564,10 +8585,25 @@ apiRouter.post(
             updated_at = EXCLUDED.updated_at
         `, [buyerAddress, amountToBuyer, now]);
       }
+      const sellerW = await db.query(
+        'SELECT address FROM wallets WHERE user_id = $1 ORDER BY id ASC LIMIT 1',
+        [trade.seller_id],
+      );
+      const sellerAddrRepair = sellerW.rows[0]?.address
+        ? String(sellerW.rows[0].address).toLowerCase()
+        : null;
+
       await db.query(
-        `INSERT INTO internal_transfers (from_user_id, to_user_id, amount, note)
-         VALUES ($1, $2, $3, $4)`,
-        [trade.seller_id, trade.buyer_id, amountToBuyer, `admin repair credit for trade #${tradeId}`]
+        `INSERT INTO internal_transfers (from_user_id, to_user_id, amount, note, from_wallet_address, to_wallet_address)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          trade.seller_id,
+          trade.buyer_id,
+          amountToBuyer,
+          `admin repair credit for trade #${tradeId}`,
+          sellerAddrRepair,
+          buyerAddress,
+        ],
       );
       res.json({ success: true, credited: amountToBuyer, buyer_wallet: buyerAddress });
     } catch (e) {

@@ -537,6 +537,13 @@ export async function runMigrations() {
     `);
 
     await client.query(`
+      ALTER TABLE internal_transfers ADD COLUMN IF NOT EXISTS from_wallet_address VARCHAR(255);
+    `);
+    await client.query(`
+      ALTER TABLE internal_transfers ADD COLUMN IF NOT EXISTS to_wallet_address VARCHAR(255);
+    `);
+
+    await client.query(`
       CREATE TABLE IF NOT EXISTS fda_holdings (
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL,
