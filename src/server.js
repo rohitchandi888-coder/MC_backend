@@ -323,6 +323,19 @@ async function getP2PMinPricePerFda(defaultValue = 1) {
   return Number.isFinite(legacy) && legacy > 0 ? legacy : defaultValue;
 }
 
+/** Minimum price per FDA for USDT-denominated offers (admin: p2p_min_price_per_fda_usdt). */
+async function getP2PMinPricePerFdaUsdt(defaultValue = 1) {
+  const v = await getNumericSetting('p2p_min_price_per_fda_usdt', Number.NaN);
+  if (Number.isFinite(v) && v > 0) return v;
+  return defaultValue;
+}
+
+async function getP2PMinPricePerFdaForFiat(fiatNorm, defaultValue = 1) {
+  const f = String(fiatNorm || '').toUpperCase().trim();
+  if (f === 'USDT') return getP2PMinPricePerFdaUsdt(defaultValue);
+  return getP2PMinPricePerFda(defaultValue);
+}
+
 async function evaluateHoldingRewardEligibility(userId, holding, settings) {
   const amount = parseFloat(holding.amount || 0);
   const holdingPlan = String(holding.holding_plan || 'standard').toLowerCase() === 'merchant_buy'
@@ -1464,7 +1477,7 @@ apiRouter.get('/auth/profile', authMiddleware, async (req, res) => {
 
     const row = await db
 
-      .prepare('SELECT id, fda_user_id, email, phone, full_name, is_admin, created_at FROM users WHERE id = ?')
+      .prepare('SELECT id, fda_user_id, email, phone, full_name, is_admin, created_at, p2p_usdt_payout_address FROM users WHERE id = ?')
 
       .get(req.user.id);
 
@@ -1495,6 +1508,9 @@ apiRouter.get('/auth/profile', authMiddleware, async (req, res) => {
 
       created_at: row.created_at,
       fda_price: Number.isFinite(fdaPrice) ? fdaPrice : null,
+      p2p_usdt_payout_address: row.p2p_usdt_payout_address
+        ? String(row.p2p_usdt_payout_address).trim()
+        : null,
 
     });
 
@@ -1508,79 +1524,116 @@ apiRouter.get('/auth/profile', authMiddleware, async (req, res) => {
 
 });
 
+const BEP20_ADDRESS_RE = /^0x[a-fA-F0-9]{40}$/;
+
+apiRouter.put('/auth/p2p-usdt-payout', authMiddleware, async (req, res) => {
+  const raw = req.body?.address;
+  if (raw === undefined || raw === null) {
+    return res.status(400).json({ error: 'Missing address (use empty string to clear)' });
+  }
+  const trimmed = String(raw).trim();
+  if (trimmed && !BEP20_ADDRESS_RE.test(trimmed)) {
+    return res.status(400).json({
+      error: 'Invalid BEP20 address. Use 0x followed by 40 hexadecimal characters.',
+    });
+  }
+  try {
+    await db.query('UPDATE users SET p2p_usdt_payout_address = $1 WHERE id = $2', [
+      trimmed || null,
+      req.user.id,
+    ]);
+    res.json({ p2p_usdt_payout_address: trimmed || null });
+  } catch (err) {
+    console.error('PUT /auth/p2p-usdt-payout error:', err);
+    res.status(500).json({ error: 'Failed to update USDT payout address' });
+  }
+});
+
 
 
 // Update Profile
 
 apiRouter.put('/auth/profile', authMiddleware, async (req, res) => {
 
-  const { full_name, email, phone } = req.body;
+  const body = req.body || {};
+  const { full_name, email, phone } = body;
+  const hasUsdtKey = Object.prototype.hasOwnProperty.call(body, 'p2p_usdt_payout_address');
 
+  if (!email && !phone && !hasUsdtKey) {
 
-
-  if (!email && !phone) {
-
-    return res.status(400).json({ error: 'Email or phone is required' });
+    return res.status(400).json({ error: 'Email, phone, or USDT payout update is required' });
 
   }
 
-
-
   try {
 
-    // Check if email or phone is already taken by another user
+    if (hasUsdtKey) {
 
-    if (email) {
-
-      const existingEmail = await db
-
-        .prepare('SELECT id FROM users WHERE email = ? AND id != ?')
-
-        .get(email, req.user.id);
-
-      if (existingEmail) {
-
-        return res.status(400).json({ error: 'Email already registered' });
-
+      const raw = body.p2p_usdt_payout_address;
+      const trimmed = raw === null || raw === undefined ? '' : String(raw).trim();
+      if (trimmed && !BEP20_ADDRESS_RE.test(trimmed)) {
+        return res.status(400).json({
+          error: 'Invalid BEP20 address. Use 0x followed by 40 hexadecimal characters.',
+        });
       }
+      await db.query('UPDATE users SET p2p_usdt_payout_address = $1 WHERE id = $2', [
+        trimmed || null,
+        req.user.id,
+      ]);
 
     }
 
+    if (email || phone) {
 
+      // Check if email or phone is already taken by another user
 
-    if (phone) {
+      if (email) {
 
-      const existingPhone = await db
+        const existingEmail = await db
 
-        .prepare('SELECT id FROM users WHERE phone = ? AND id != ?')
+          .prepare('SELECT id FROM users WHERE email = ? AND id != ?')
 
-        .get(phone, req.user.id);
+          .get(email, req.user.id);
 
-      if (existingPhone) {
+        if (existingEmail) {
 
-        return res.status(400).json({ error: 'Phone number already registered' });
+          return res.status(400).json({ error: 'Email already registered' });
+
+        }
 
       }
 
+      if (phone) {
+
+        const existingPhone = await db
+
+          .prepare('SELECT id FROM users WHERE phone = ? AND id != ?')
+
+          .get(phone, req.user.id);
+
+        if (existingPhone) {
+
+          return res.status(400).json({ error: 'Phone number already registered' });
+
+        }
+
+      }
+
+      await db
+
+        .prepare('UPDATE users SET full_name = ?, email = ?, phone = ? WHERE id = ?')
+
+        .run(full_name || null, email || null, phone || null, req.user.id);
+
     }
-
-
-
-    await db
-
-      .prepare('UPDATE users SET full_name = ?, email = ?, phone = ? WHERE id = ?')
-
-      .run(full_name || null, email || null, phone || null, req.user.id);
-
-
 
     const updated = await db
 
-      .prepare('SELECT id, fda_user_id, email, phone, full_name, is_admin, created_at FROM users WHERE id = ?')
+      .prepare(
+        'SELECT id, fda_user_id, email, phone, full_name, is_admin, created_at, p2p_usdt_payout_address FROM users WHERE id = ?',
+      )
 
       .get(req.user.id);
-
-
 
     res.json({
 
@@ -1595,6 +1648,9 @@ apiRouter.put('/auth/profile', authMiddleware, async (req, res) => {
       is_admin: !!updated.is_admin,
 
       created_at: updated.created_at,
+      p2p_usdt_payout_address: updated.p2p_usdt_payout_address
+        ? String(updated.p2p_usdt_payout_address).trim()
+        : null,
 
     });
 
@@ -1894,13 +1950,31 @@ console.log("this is requestbody", req.body);
     return res.status(400).json({ error: 'Price must be a valid number greater than 0' });
   }
 
-
+  const fiatNorm = String(fiatCurrency || '').toUpperCase().trim();
+  if (fiatNorm !== 'INR' && fiatNorm !== 'USDT') {
+    return res.status(400).json({ error: 'Only INR and USDT are allowed as offer price currencies.' });
+  }
+  if (fiatNorm === 'USDT') {
+    const maker = await db
+      .prepare('SELECT p2p_usdt_payout_address FROM users WHERE id = ?')
+      .get(req.user.id);
+    const payout = maker?.p2p_usdt_payout_address
+      ? String(maker.p2p_usdt_payout_address).trim()
+      : '';
+    if (!payout || !BEP20_ADDRESS_RE.test(payout)) {
+      return res.status(400).json({
+        error:
+          'Save a USDT (BEP20) payout address under Payment Methods before creating USDT offers.',
+      });
+    }
+  }
 
   try {
-    const minOfferAmount = Math.max(0, await getP2PMinPricePerFda(1));
+    const minOfferAmount = Math.max(0, await getP2PMinPricePerFdaForFiat(fiatNorm, 1));
     if (priceNum < minOfferAmount) {
+      const unit = fiatNorm === 'USDT' ? 'USDT' : 'INR';
       return res.status(400).json({
-        error: `Minimum price per FDA is ${minOfferAmount} for both BUY and SELL offers.`,
+        error: `Minimum price per FDA is ${minOfferAmount} ${unit} for both BUY and SELL offers.`,
       });
     }
 
@@ -2104,7 +2178,7 @@ console.log("this is requestbody", req.body);
 
       assetSymbol,
 
-      fiatCurrency,
+      fiatNorm,
 
       price,
 
@@ -6418,11 +6492,78 @@ apiRouter.get('/internal/transfers', authMiddleware, async (req, res) => {
 
 });
 
+/** Sum internal FDA for every wallet address linked to this user (holdings are user-scoped). */
+async function getTotalInternalFdaAcrossUserWallets(userId) {
+  const balanceResult = await db.query(
+    `
+      SELECT COALESCE(SUM(CAST(ib.fda_balance AS DOUBLE PRECISION)), 0) AS total
+      FROM internal_balances ib
+      INNER JOIN wallets w ON LOWER(TRIM(w.address)) = LOWER(TRIM(ib.wallet_address))
+      WHERE w.user_id = $1
+    `,
+    [userId],
+  );
+  const total = parseFloat(balanceResult.rows[0]?.total);
+  return Number.isFinite(total) ? total : 0;
+}
 
+/** Internal FDA balance for a single on-chain wallet row (MC internal ledger). */
+async function getInternalFdaForWallet(walletAddress) {
+  const balanceResult = await db.query(
+    `
+      SELECT COALESCE(CAST(ib.fda_balance AS DOUBLE PRECISION), 0) AS total
+      FROM internal_balances ib
+      WHERE LOWER(TRIM(ib.wallet_address)) = LOWER(TRIM($1))
+    `,
+    [walletAddress],
+  );
+  const total = parseFloat(balanceResult.rows[0]?.total);
+  return Number.isFinite(total) ? total : 0;
+}
+
+/**
+ * Usable FDA for starting a new hold from the selected wallet (or all wallets if no address).
+ * Open SELL offers already decrement `internal_balances` on the wallet that created the offer, so we must
+ * **not** subtract SUM(offers.remaining) again (that double-counted and blocked holds on other wallets).
+ * We still subtract active holds and the global reserve (holdings are user-scoped; reserve is admin policy).
+ */
+async function getHoldingUsableSnapshot(userId, primaryWalletAddress) {
+  const holdingReserveAmount = await getNumericSetting('holding_fda_amount', 0);
+  const totalBalance = primaryWalletAddress
+    ? await getInternalFdaForWallet(primaryWalletAddress)
+    : await getTotalInternalFdaAcrossUserWallets(userId);
+  const lockedResult = await db.query(
+    `
+      SELECT COALESCE(SUM(remaining), 0) AS locked
+      FROM offers
+      WHERE maker_id = $1 AND type = 'SELL' AND status = 'OPEN' AND asset_symbol = 'FDA'
+    `,
+    [userId],
+  );
+  const locked = parseFloat(lockedResult.rows[0]?.locked || 0);
+  const activeHoldingResult = await db.query(
+    `
+      SELECT COALESCE(SUM(amount), 0) AS holding_locked
+      FROM fda_holdings
+      WHERE user_id = $1 AND expires_at > CURRENT_TIMESTAMP
+    `,
+    [userId],
+  );
+  const activeHoldingLocked = parseFloat(activeHoldingResult.rows[0]?.holding_locked || 0);
+  const usableBalance = Math.max(0, totalBalance - activeHoldingLocked - holdingReserveAmount);
+  return {
+    totalBalance,
+    locked,
+    activeHoldingLocked,
+    holdingReserveAmount,
+    usableBalance,
+  };
+}
 
 apiRouter.get('/internal/holdings/reward-status', authMiddleware, async (_req, res) => {
   try {
     const userId = _req.user.id;
+    const qWallet = String(_req.query?.wallet_address || '').toLowerCase().trim();
     const rewardSettings = {
       rewardRate: await getNumericSetting('holding_reward_rate', 5),
       rewardMinAmount: await getNumericSetting('holding_reward_min_amount', 25),
@@ -6470,6 +6611,25 @@ apiRouter.get('/internal/holdings/reward-status', authMiddleware, async (_req, r
       });
     }
 
+    let holdingBalanceSummary = null;
+    if (qWallet) {
+      const ownerCheck = await db.query(
+        'SELECT user_id FROM wallets WHERE LOWER(TRIM(address)) = LOWER(TRIM($1)) LIMIT 1',
+        [qWallet],
+      );
+      if (!ownerCheck.rows[0] || ownerCheck.rows[0].user_id !== userId) {
+        return res.status(403).json({ error: 'Wallet does not belong to the authenticated user' });
+      }
+      const holdSnap = await getHoldingUsableSnapshot(userId, qWallet);
+      holdingBalanceSummary = {
+        totalInternalFdaAllWallets: Number(holdSnap.totalBalance.toFixed(18)),
+        usableForNewHold: Number(holdSnap.usableBalance.toFixed(18)),
+        lockedInOpenSellOffers: Number(holdSnap.locked.toFixed(18)),
+        activeHoldingsAmount: Number(holdSnap.activeHoldingLocked.toFixed(18)),
+        holdingReserve: Number(holdSnap.holdingReserveAmount.toFixed(18)),
+      };
+    }
+
     res.json({
       settings: {
         rewardRate: rewardSettings.rewardRate,
@@ -6482,6 +6642,7 @@ apiRouter.get('/internal/holdings/reward-status', authMiddleware, async (_req, r
       },
       pendingReward: Number(pendingReward.toFixed(18)),
       holdings,
+      holdingBalanceSummary,
     });
   } catch (err) {
     console.error('Reward status error:', err);
@@ -6664,44 +6825,16 @@ apiRouter.post('/internal/holdings/start', authMiddleware, async (req, res) => {
         ? Math.max(12, Math.floor(await getNumericSetting('holding_reward_period_months_merchant_buy', 12)))
         : Math.max(1, Math.floor(await getNumericSetting('holding_reward_period_months', 12)));
     const fdaPrice = await getNumericSetting('fda_price', 0);
-    const holdingReserveAmount = await getNumericSetting('holding_fda_amount', 0);
 
     if (amountNum < minAmount) {
       return res.status(400).json({ error: `Minimum hold amount for ${holdPlan === 'merchant_buy' ? 'Merchant Buy' : 'Standard'} plan is ${minAmount} FDA.` });
     }
 
-    const balanceResult = await db.query(
-      'SELECT fda_balance FROM internal_balances WHERE LOWER(TRIM(wallet_address)) = LOWER(TRIM($1))',
-      [walletAddress],
-    );
-    const totalBalance = balanceResult.rows.length
-      ? balanceResult.rows.reduce((sum, row) => sum + parseFloat(row.fda_balance || 0), 0)
-      : 0;
+    const holdSnap = await getHoldingUsableSnapshot(userId, walletAddress);
 
-    const lockedResult = await db.query(
-      `
-        SELECT COALESCE(SUM(remaining), 0) as locked
-        FROM offers
-        WHERE maker_id = $1 AND type = 'SELL' AND status = 'OPEN' AND asset_symbol = 'FDA'
-      `,
-      [userId],
-    );
-    const locked = parseFloat(lockedResult.rows[0]?.locked || 0);
-
-    const activeHoldingResult = await db.query(
-      `
-        SELECT COALESCE(SUM(amount), 0) as holding_locked
-        FROM fda_holdings
-        WHERE user_id = $1 AND expires_at > CURRENT_TIMESTAMP
-      `,
-      [userId],
-    );
-    const activeHoldingLocked = parseFloat(activeHoldingResult.rows[0]?.holding_locked || 0);
-    const usableBalance = Math.max(0, totalBalance - locked - activeHoldingLocked - holdingReserveAmount);
-
-    if (usableBalance < amountNum) {
+    if (holdSnap.usableBalance < amountNum) {
       return res.status(400).json({
-        error: `Insufficient usable balance for holding start. Usable ${usableBalance.toFixed(18)} FDA, requested ${amountNum} FDA.`,
+        error: `Insufficient usable balance for holding start on this wallet. Usable ${holdSnap.usableBalance.toFixed(18)} FDA (internal balance on the selected address ${holdSnap.totalBalance.toFixed(18)} FDA, minus active holds and reserve). Open sell offers already reduced the wallets that posted them. Requested ${amountNum} FDA.`,
       });
     }
 
@@ -6803,15 +6936,21 @@ apiRouter.get('/settings/holding-fda-amount', async (_req, res) => {
 apiRouter.get('/settings/min-price-per-fda', async (_req, res) => {
 
   const minPricePerFda = await getP2PMinPricePerFda(1);
+  const minPricePerFdaUsdt = await getP2PMinPricePerFdaUsdt(1);
 
-  res.json({ minPricePerFda, minOfferAmount: minPricePerFda });
+  res.json({
+    minPricePerFda,
+    minPricePerFdaUsdt,
+    minOfferAmount: minPricePerFda,
+  });
 
 });
 
 apiRouter.get('/settings/min-offer-amount', async (_req, res) => {
   const minPricePerFda = await getP2PMinPricePerFda(1);
+  const minPricePerFdaUsdt = await getP2PMinPricePerFdaUsdt(1);
   // Legacy endpoint kept for backward compatibility.
-  res.json({ minOfferAmount: minPricePerFda, minPricePerFda });
+  res.json({ minOfferAmount: minPricePerFda, minPricePerFda, minPricePerFdaUsdt });
 });
 
 apiRouter.get('/settings/holding-reward', async (_req, res) => {
@@ -6870,7 +7009,7 @@ apiRouter.put('/admin/settings/:key', authMiddleware, adminMiddleware, async (re
 
   }
 
-  if (normalizedKey === 'p2p_min_price_per_fda') {
+  if (normalizedKey === 'p2p_min_price_per_fda' || normalizedKey === 'p2p_min_price_per_fda_usdt') {
 
     const valueStr = String(value).trim();
 

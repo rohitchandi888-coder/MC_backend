@@ -187,7 +187,8 @@ export async function runMigrations() {
       { name: 'user_city', type: 'VARCHAR(255)' },
       { name: 'inr_price', type: 'NUMERIC(20, 8)' },
       { name: 'reff_id', type: 'INTEGER' },
-      { name: 'fda_full_data', type: 'JSONB' }
+      { name: 'fda_full_data', type: 'JSONB' },
+      { name: 'p2p_usdt_payout_address', type: 'VARCHAR(100)' },
     ];
 
     for (const column of columnsToAdd) {
@@ -636,7 +637,8 @@ export async function runMigrations() {
     // Initialize default settings if they don't exist
     const defaultSettings = [
       { key: 'p2p_fee_rate', value: '1', description: 'P2P Trading Fee Rate (percentage, e.g., 1 for 1%, 5 for 5%)' },
-      { key: 'p2p_min_price_per_fda', value: '1', description: 'Minimum price per FDA required to create a P2P offer (applies to both BUY and SELL)' },
+      { key: 'p2p_min_price_per_fda', value: '1', description: 'Minimum price per FDA (INR) for INR-denominated P2P offers (BUY and SELL)' },
+      { key: 'p2p_min_price_per_fda_usdt', value: '1', description: 'Minimum price per FDA (USDT) for USDT-denominated P2P offers (BUY and SELL)' },
       { key: 'holding_fda_amount', value: '0', description: 'Minimum FDA balance to hold (users cannot use this amount for offers or transfers, e.g., 2.5 for 2.5 FDA)' },
       { key: 'holding_reward_rate', value: '5', description: 'FDA holding reward percentage (e.g., 5 means 5%)' },
       { key: 'holding_reward_min_amount', value: '25', description: 'Minimum FDA amount required in one holding lot to qualify for reward' },
