@@ -189,6 +189,7 @@ export async function runMigrations() {
       { name: 'reff_id', type: 'INTEGER' },
       { name: 'fda_full_data', type: 'JSONB' },
       { name: 'p2p_usdt_payout_address', type: 'VARCHAR(100)' },
+      { name: 'merchant_buy_eligible', type: 'INTEGER NOT NULL DEFAULT 0' },
     ];
 
     for (const column of columnsToAdd) {
@@ -338,6 +339,21 @@ export async function runMigrations() {
         FOREIGN KEY (seller_id) REFERENCES users(id)
       );
     `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS trade_messages (
+        id SERIAL PRIMARY KEY,
+        trade_id INTEGER NOT NULL,
+        sender_id INTEGER NOT NULL,
+        message TEXT NOT NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (trade_id) REFERENCES trades(id) ON DELETE CASCADE,
+        FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_trade_messages_trade_created
+      ON trade_messages (trade_id, created_at ASC);
+    `);
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS disputes (
@@ -482,6 +498,28 @@ export async function runMigrations() {
         await client.query(`
           ALTER TABLE internal_balances 
           ALTER COLUMN wallet_address SET NOT NULL;
+        `);
+        // Cleanup legacy user_id unique constraints/indexes that can still block multi-wallet inserts.
+        const userIdUniqueConstraints = await client.query(`
+          SELECT tc.constraint_name
+          FROM information_schema.table_constraints tc
+          JOIN information_schema.constraint_column_usage ccu
+            ON tc.constraint_name = ccu.constraint_name
+          WHERE tc.table_name = 'internal_balances'
+            AND tc.constraint_type = 'UNIQUE'
+            AND ccu.column_name = 'user_id'
+        `);
+        for (const row of userIdUniqueConstraints.rows) {
+          await client.query(`
+            ALTER TABLE internal_balances
+            DROP CONSTRAINT IF EXISTS ${row.constraint_name}
+          `);
+          console.log(`[Migration] ✅ Dropped legacy unique constraint: ${row.constraint_name}`);
+        }
+        // Drop legacy user_id column if it still exists.
+        await client.query(`
+          ALTER TABLE internal_balances
+          DROP COLUMN IF EXISTS user_id CASCADE
         `);
         
         // Add unique constraint if it doesn't exist

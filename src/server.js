@@ -2263,9 +2263,11 @@ apiRouter.get('/trades', authMiddleware, async (req, res) => {
 
               ob.email as buyer_email, ob.phone as buyer_phone, ob.full_name as buyer_name,
 
-              os.email as seller_email, os.phone as seller_phone, os.full_name as seller_name
+              os.email as seller_email, os.phone as seller_phone, os.full_name as seller_name,
+              o.payment_methods as seller_payment_methods
 
        FROM trades t
+       JOIN offers o ON o.id = t.offer_id
 
        JOIN users ob ON ob.id = t.buyer_id
 
@@ -2283,6 +2285,72 @@ apiRouter.get('/trades', authMiddleware, async (req, res) => {
 
   res.json(rows);
 
+});
+
+apiRouter.get('/trades/:id/messages', authMiddleware, async (req, res) => {
+  const tradeId = Number(req.params.id);
+  if (!Number.isFinite(tradeId) || tradeId <= 0) {
+    return res.status(400).json({ error: 'Invalid trade ID' });
+  }
+  try {
+    const trade = await db.prepare('SELECT id, buyer_id, seller_id FROM trades WHERE id = ?').get(tradeId);
+    if (!trade) return res.status(404).json({ error: 'Trade not found' });
+    if (trade.buyer_id !== req.user.id && trade.seller_id !== req.user.id) {
+      return res.status(403).json({ error: 'Not allowed' });
+    }
+    const rows = await db.prepare(`
+      SELECT tm.id, tm.trade_id, tm.sender_id, tm.message, tm.created_at,
+             u.full_name as sender_name, u.email as sender_email
+      FROM trade_messages tm
+      JOIN users u ON u.id = tm.sender_id
+      WHERE tm.trade_id = ?
+      ORDER BY tm.created_at ASC, tm.id ASC
+      LIMIT 300
+    `).all(tradeId);
+    return res.json(rows || []);
+  } catch (_err) {
+    return res.status(500).json({ error: 'Failed to load trade messages' });
+  }
+});
+
+apiRouter.post('/trades/:id/messages', authMiddleware, async (req, res) => {
+  const tradeId = Number(req.params.id);
+  const text = String(req.body?.message || '').trim();
+  if (!Number.isFinite(tradeId) || tradeId <= 0) {
+    return res.status(400).json({ error: 'Invalid trade ID' });
+  }
+  if (!text) {
+    return res.status(400).json({ error: 'Message is required' });
+  }
+  if (text.length > 1000) {
+    return res.status(400).json({ error: 'Message is too long (max 1000 chars)' });
+  }
+  try {
+    const trade = await db.prepare('SELECT id, buyer_id, seller_id, status FROM trades WHERE id = ?').get(tradeId);
+    if (!trade) return res.status(404).json({ error: 'Trade not found' });
+    if (trade.buyer_id !== req.user.id && trade.seller_id !== req.user.id) {
+      return res.status(403).json({ error: 'Not allowed' });
+    }
+    const status = String(trade.status || '').toUpperCase();
+    if (status === 'COMPLETED' || status === 'CANCELLED') {
+      return res.status(400).json({ error: 'Chat is closed for this trade.' });
+    }
+    const info = await db.prepare(`
+      INSERT INTO trade_messages (trade_id, sender_id, message)
+      VALUES (?, ?, ?)
+    `).run(tradeId, req.user.id, text);
+    const created = await db.prepare(`
+      SELECT tm.id, tm.trade_id, tm.sender_id, tm.message, tm.created_at,
+             u.full_name as sender_name, u.email as sender_email
+      FROM trade_messages tm
+      JOIN users u ON u.id = tm.sender_id
+      WHERE tm.id = ?
+      LIMIT 1
+    `).get(info.lastInsertRowid);
+    return res.json(created);
+  } catch (_err) {
+    return res.status(500).json({ error: 'Failed to send message' });
+  }
 });
 
 
@@ -2785,7 +2853,7 @@ apiRouter.post('/trades', authMiddleware, async (req, res) => {
       INSERT INTO internal_balances
       (user_id,wallet_address,fda_balance,updated_at)
       VALUES (?, ?, 0, CURRENT_TIMESTAMP)
-      ON CONFLICT(wallet_address) DO NOTHING
+      ON CONFLICT DO NOTHING
     `).run(buyerId, buyerWalletAddress);
 
 
@@ -2793,7 +2861,7 @@ apiRouter.post('/trades', authMiddleware, async (req, res) => {
       INSERT INTO internal_balances
       (user_id,wallet_address,fda_balance,updated_at)
       VALUES (?, ?, 0, CURRENT_TIMESTAMP)
-      ON CONFLICT(wallet_address) DO NOTHING
+      ON CONFLICT DO NOTHING
     `).run(sellerId, sellerWalletAddress);
 
 
@@ -6667,6 +6735,35 @@ async function getHoldingUsableSnapshot(userId, primaryWalletAddress) {
   };
 }
 
+async function isMerchantBuyEligible(userId) {
+  // Admin override column on users table.
+  try {
+    const userResult = await db.query(
+      'SELECT merchant_buy_eligible FROM users WHERE id = $1 LIMIT 1',
+      [userId],
+    );
+    const flag = Number(userResult.rows?.[0]?.merchant_buy_eligible || 0);
+    if (flag === 1) return true;
+  } catch {
+    // continue with behavioral check
+  }
+
+  // Behavioral eligibility: user must have at least one completed FDA buy trade.
+  const completedBuyResult = await db.query(
+    `
+      SELECT 1
+      FROM trades t
+      LEFT JOIN offers o ON o.id = t.offer_id
+      WHERE t.buyer_id = $1
+        AND t.status = 'COMPLETED'
+        AND UPPER(COALESCE(t.asset_symbol, o.asset_symbol, 'FDA')) = 'FDA'
+      LIMIT 1
+    `,
+    [userId],
+  );
+  return Boolean(completedBuyResult.rows?.[0]);
+}
+
 apiRouter.get('/internal/holdings/reward-status', authMiddleware, async (_req, res) => {
   try {
     const userId = _req.user.id;
@@ -6681,6 +6778,7 @@ apiRouter.get('/internal/holdings/reward-status', authMiddleware, async (_req, r
       merchantBuyRewardPeriodMonths: await getNumericSetting('holding_reward_period_months_merchant_buy', 12),
       fdaPrice: await getNumericSetting('fda_price', 0),
     };
+    const merchantBuyEligible = await isMerchantBuyEligible(userId);
     const holdingsResult = (qWallet && hasWalletScopedHoldings)
       ? await db.query(
         `
@@ -6760,6 +6858,7 @@ apiRouter.get('/internal/holdings/reward-status', authMiddleware, async (_req, r
         merchantBuyRewardRate: Math.max(0, rewardSettings.merchantBuyRewardRate),
         merchantBuyRewardPeriodMonths: Math.max(12, Math.floor(rewardSettings.merchantBuyRewardPeriodMonths)),
         fdaPrice: Number.isFinite(rewardSettings.fdaPrice) ? rewardSettings.fdaPrice : 0,
+        merchantBuyEligible,
       },
       pendingReward: Number(pendingReward.toFixed(18)),
       holdings,
@@ -6947,6 +7046,14 @@ apiRouter.post('/internal/holdings/start', authMiddleware, async (req, res) => {
 
     const userId = req.user.id;
     const hasWalletScopedHoldings = await hasFdaHoldingsWalletAddressColumn();
+    if (holdPlan === 'merchant_buy') {
+      const merchantEligible = await isMerchantBuyEligible(userId);
+      if (!merchantEligible) {
+        return res.status(403).json({
+          error: 'Merchant Buy hold is allowed only for users with completed FDA buy history on MerchantCoinWallet.',
+        });
+      }
+    }
     const minAmount =
       holdPlan === 'merchant_buy'
         ? Math.max(10, await getNumericSetting('holding_reward_min_amount_merchant_buy', 10))
