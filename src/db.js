@@ -538,6 +538,26 @@ export async function runMigrations() {
     `);
 
     await client.query(`
+      CREATE TABLE IF NOT EXISTS onchain_transfers (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        from_wallet_address VARCHAR(255) NOT NULL,
+        to_wallet_address VARCHAR(255) NOT NULL,
+        asset_symbol VARCHAR(50) NOT NULL,
+        token_address VARCHAR(255),
+        amount NUMERIC(30, 18) NOT NULL,
+        tx_hash VARCHAR(255) NOT NULL,
+        chain VARCHAR(50) NOT NULL DEFAULT 'BNB',
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_onchain_transfers_user_created
+      ON onchain_transfers (user_id, created_at DESC);
+    `);
+
+    await client.query(`
       ALTER TABLE internal_transfers ADD COLUMN IF NOT EXISTS from_wallet_address VARCHAR(255);
     `);
     await client.query(`
@@ -548,6 +568,7 @@ export async function runMigrations() {
       CREATE TABLE IF NOT EXISTS fda_holdings (
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL,
+        wallet_address VARCHAR(255),
         holding_plan VARCHAR(20) NOT NULL DEFAULT 'standard',
         amount NUMERIC(30, 18) NOT NULL,
         holding_period VARCHAR(20) NOT NULL,
@@ -580,6 +601,7 @@ export async function runMigrations() {
 
     // Ensure reward tracking columns exist on fda_holdings
     const holdingsColumnsToAdd = [
+      { name: 'wallet_address', type: 'VARCHAR(255)' },
       { name: 'reward_rate', type: 'NUMERIC(10, 4)' },
       { name: 'base_fda_price', type: 'NUMERIC(30, 8)' },
       { name: 'reward_value_locked', type: 'NUMERIC(30, 8)' },

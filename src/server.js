@@ -316,6 +316,27 @@ async function getNumericSetting(key, defaultValue = 0) {
   return Number.isFinite(parsed) ? parsed : defaultValue;
 }
 
+let hasFdaHoldingsWalletAddressColumnCache = null;
+async function hasFdaHoldingsWalletAddressColumn() {
+  if (hasFdaHoldingsWalletAddressColumnCache !== null) return hasFdaHoldingsWalletAddressColumnCache;
+  try {
+    const col = await db.query(
+      `
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_name = 'fda_holdings'
+          AND column_name = 'wallet_address'
+        LIMIT 1
+      `,
+      [],
+    );
+    hasFdaHoldingsWalletAddressColumnCache = col.rows.length > 0;
+  } catch (_err) {
+    hasFdaHoldingsWalletAddressColumnCache = false;
+  }
+  return hasFdaHoldingsWalletAddressColumnCache;
+}
+
 async function getP2PMinPricePerFda(defaultValue = 1) {
   const preferred = await getNumericSetting('p2p_min_price_per_fda', Number.NaN);
   if (Number.isFinite(preferred) && preferred > 0) return preferred;
@@ -1954,7 +1975,7 @@ console.log("this is requestbody", req.body);
   if (fiatNorm !== 'INR' && fiatNorm !== 'USDT') {
     return res.status(400).json({ error: 'Only INR and USDT are allowed as offer price currencies.' });
   }
-  if (fiatNorm === 'USDT') {
+  if (fiatNorm === 'USDT' && normalizedType === 'SELL') {
     const maker = await db
       .prepare('SELECT p2p_usdt_payout_address FROM users WHERE id = ?')
       .get(req.user.id);
@@ -1964,7 +1985,7 @@ console.log("this is requestbody", req.body);
     if (!payout || !BEP20_ADDRESS_RE.test(payout)) {
       return res.status(400).json({
         error:
-          'Save a USDT (BEP20) payout address under Payment Methods before creating USDT offers.',
+          'Save a USDT (BEP20) payout address under Payment Methods before creating USDT SELL offers.',
       });
     }
   }
@@ -6492,6 +6513,77 @@ apiRouter.get('/internal/transfers', authMiddleware, async (req, res) => {
 
 });
 
+apiRouter.post('/onchain/transfers', authMiddleware, async (req, res) => {
+  const fromWalletAddress = String(req.body?.fromAddress || '').toLowerCase().trim();
+  const toWalletAddress = String(req.body?.toAddress || '').toLowerCase().trim();
+  const assetSymbol = String(req.body?.assetSymbol || '').trim() || 'TOKEN';
+  const tokenAddressRaw = String(req.body?.tokenAddress || '').trim();
+  const txHash = String(req.body?.txHash || '').trim();
+  const amountStr = String(req.body?.amount ?? '').trim();
+  const chain = String(req.body?.chain || 'BNB').trim() || 'BNB';
+
+  if (!fromWalletAddress || !toWalletAddress || !txHash || !amountStr) {
+    return res.status(400).json({ error: 'fromAddress, toAddress, txHash, and amount are required' });
+  }
+  if (!/^\d+(\.\d{0,18})?$/.test(amountStr)) {
+    return res.status(400).json({ error: 'Amount must be a decimal with up to 18 places' });
+  }
+  const amountNum = parseFloat(amountStr);
+  if (!Number.isFinite(amountNum) || amountNum <= 0) {
+    return res.status(400).json({ error: 'Amount must be greater than 0' });
+  }
+
+  try {
+    const owner = await db.query(
+      'SELECT user_id FROM wallets WHERE LOWER(TRIM(address)) = LOWER(TRIM($1)) LIMIT 1',
+      [fromWalletAddress],
+    );
+    if (!owner.rows[0] || owner.rows[0].user_id !== req.user.id) {
+      return res.status(403).json({ error: 'fromAddress does not belong to authenticated user' });
+    }
+    await db.query(
+      `
+        INSERT INTO onchain_transfers
+          (user_id, from_wallet_address, to_wallet_address, asset_symbol, token_address, amount, tx_hash, chain, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)
+      `,
+      [
+        req.user.id,
+        fromWalletAddress,
+        toWalletAddress,
+        assetSymbol,
+        tokenAddressRaw || null,
+        amountNum,
+        txHash,
+        chain,
+      ],
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Failed to log on-chain transfer:', err);
+    res.status(500).json({ error: 'Failed to log on-chain transfer' });
+  }
+});
+
+apiRouter.get('/onchain/transfers', authMiddleware, async (req, res) => {
+  try {
+    const rows = await db.query(
+      `
+        SELECT id, user_id, from_wallet_address, to_wallet_address, asset_symbol, token_address, amount, tx_hash, chain, created_at
+        FROM onchain_transfers
+        WHERE user_id = $1
+        ORDER BY created_at DESC
+        LIMIT 200
+      `,
+      [req.user.id],
+    );
+    res.json(rows.rows);
+  } catch (err) {
+    console.error('Failed to fetch on-chain transfer history:', err);
+    res.status(500).json({ error: 'Failed to fetch on-chain transfer history' });
+  }
+});
+
 /** Sum internal FDA for every wallet address linked to this user (holdings are user-scoped). */
 async function getTotalInternalFdaAcrossUserWallets(userId) {
   const balanceResult = await db.query(
@@ -6511,7 +6603,7 @@ async function getTotalInternalFdaAcrossUserWallets(userId) {
 async function getInternalFdaForWallet(walletAddress) {
   const balanceResult = await db.query(
     `
-      SELECT COALESCE(CAST(ib.fda_balance AS DOUBLE PRECISION), 0) AS total
+      SELECT COALESCE(SUM(CAST(ib.fda_balance AS DOUBLE PRECISION)), 0) AS total
       FROM internal_balances ib
       WHERE LOWER(TRIM(ib.wallet_address)) = LOWER(TRIM($1))
     `,
@@ -6525,9 +6617,10 @@ async function getInternalFdaForWallet(walletAddress) {
  * Usable FDA for starting a new hold from the selected wallet (or all wallets if no address).
  * Open SELL offers already decrement `internal_balances` on the wallet that created the offer, so we must
  * **not** subtract SUM(offers.remaining) again (that double-counted and blocked holds on other wallets).
- * We still subtract active holds and the global reserve (holdings are user-scoped; reserve is admin policy).
+ * We still subtract active holds and the global reserve. Holds are wallet-scoped by wallet_address.
  */
 async function getHoldingUsableSnapshot(userId, primaryWalletAddress) {
+  const hasWalletScopedHoldings = await hasFdaHoldingsWalletAddressColumn();
   const holdingReserveAmount = await getNumericSetting('holding_fda_amount', 0);
   const totalBalance = primaryWalletAddress
     ? await getInternalFdaForWallet(primaryWalletAddress)
@@ -6541,14 +6634,28 @@ async function getHoldingUsableSnapshot(userId, primaryWalletAddress) {
     [userId],
   );
   const locked = parseFloat(lockedResult.rows[0]?.locked || 0);
-  const activeHoldingResult = await db.query(
-    `
-      SELECT COALESCE(SUM(amount), 0) AS holding_locked
-      FROM fda_holdings
-      WHERE user_id = $1 AND expires_at > CURRENT_TIMESTAMP
-    `,
-    [userId],
-  );
+  const activeHoldingResult = (primaryWalletAddress && hasWalletScopedHoldings)
+    ? await db.query(
+      `
+        SELECT COALESCE(SUM(amount), 0) AS holding_locked
+        FROM fda_holdings
+        WHERE user_id = $1
+          AND claimed_at IS NULL
+          AND expires_at > CURRENT_TIMESTAMP
+          AND LOWER(TRIM(wallet_address)) = LOWER(TRIM($2))
+      `,
+      [userId, primaryWalletAddress],
+    )
+    : await db.query(
+      `
+        SELECT COALESCE(SUM(amount), 0) AS holding_locked
+        FROM fda_holdings
+        WHERE user_id = $1
+          AND claimed_at IS NULL
+          AND expires_at > CURRENT_TIMESTAMP
+      `,
+      [userId],
+    );
   const activeHoldingLocked = parseFloat(activeHoldingResult.rows[0]?.holding_locked || 0);
   const usableBalance = Math.max(0, totalBalance - activeHoldingLocked - holdingReserveAmount);
   return {
@@ -6564,6 +6671,7 @@ apiRouter.get('/internal/holdings/reward-status', authMiddleware, async (_req, r
   try {
     const userId = _req.user.id;
     const qWallet = String(_req.query?.wallet_address || '').toLowerCase().trim();
+    const hasWalletScopedHoldings = await hasFdaHoldingsWalletAddressColumn();
     const rewardSettings = {
       rewardRate: await getNumericSetting('holding_reward_rate', 5),
       rewardMinAmount: await getNumericSetting('holding_reward_min_amount', 25),
@@ -6573,16 +6681,28 @@ apiRouter.get('/internal/holdings/reward-status', authMiddleware, async (_req, r
       merchantBuyRewardPeriodMonths: await getNumericSetting('holding_reward_period_months_merchant_buy', 12),
       fdaPrice: await getNumericSetting('fda_price', 0),
     };
-    const holdingsResult = await db.query(
-      `
-        SELECT id, holding_plan, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount, base_fda_price, reward_value_locked,
-               break_request_status, break_request_note, break_requested_at, break_decided_at
-        FROM fda_holdings
-        WHERE user_id = $1
-        ORDER BY created_at DESC
-      `,
-      [userId],
-    );
+    const holdingsResult = (qWallet && hasWalletScopedHoldings)
+      ? await db.query(
+        `
+          SELECT id, wallet_address, holding_plan, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount, base_fda_price, reward_value_locked,
+                 break_request_status, break_request_note, break_requested_at, break_decided_at
+          FROM fda_holdings
+          WHERE user_id = $1
+            AND LOWER(TRIM(wallet_address)) = LOWER(TRIM($2))
+          ORDER BY created_at DESC
+        `,
+        [userId, qWallet],
+      )
+      : await db.query(
+        `
+          SELECT id, ${hasWalletScopedHoldings ? 'wallet_address,' : ''} holding_plan, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount, base_fda_price, reward_value_locked,
+                 break_request_status, break_request_note, break_requested_at, break_decided_at
+          FROM fda_holdings
+          WHERE user_id = $1
+          ORDER BY created_at DESC
+        `,
+        [userId],
+      );
 
     const holdings = [];
     let pendingReward = 0;
@@ -6592,6 +6712,7 @@ apiRouter.get('/internal/holdings/reward-status', authMiddleware, async (_req, r
       holdings.push({
         id: holding.id,
         plan: eligibility.holdingPlan || 'standard',
+        walletAddress: hasWalletScopedHoldings && holding.wallet_address ? String(holding.wallet_address).toLowerCase() : null,
         amount: parseFloat(holding.amount),
         holdingPeriod: holding.holding_period,
         createdAt: holding.created_at,
@@ -6716,6 +6837,7 @@ apiRouter.post('/internal/holdings/claim-rewards', authMiddleware, async (req, r
     }
 
     const userId = req.user.id;
+    const hasWalletScopedHoldings = await hasFdaHoldingsWalletAddressColumn();
     const rewardSettings = {
       rewardRate: await getNumericSetting('holding_reward_rate', 5),
       rewardMinAmount: await getNumericSetting('holding_reward_min_amount', 25),
@@ -6725,14 +6847,26 @@ apiRouter.post('/internal/holdings/claim-rewards', authMiddleware, async (req, r
       merchantBuyRewardPeriodMonths: await getNumericSetting('holding_reward_period_months_merchant_buy', 12),
       fdaPrice: await getNumericSetting('fda_price', 0),
     };
-    const holdingsResult = await db.query(
-      `
-        SELECT id, holding_plan, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount, base_fda_price, reward_value_locked, break_request_status
-        FROM fda_holdings
-        WHERE user_id = $1 AND claimed_at IS NULL
-      `,
-      [userId],
-    );
+    const holdingsResult = hasWalletScopedHoldings
+      ? await db.query(
+        `
+          SELECT id, wallet_address, holding_plan, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount, base_fda_price, reward_value_locked, break_request_status
+          FROM fda_holdings
+          WHERE user_id = $1
+            AND claimed_at IS NULL
+            AND LOWER(TRIM(wallet_address)) = LOWER(TRIM($2))
+        `,
+        [userId, walletAddress],
+      )
+      : await db.query(
+        `
+          SELECT id, holding_plan, amount, holding_period, expires_at, created_at, claimed_at, reward_rate, reward_amount, base_fda_price, reward_value_locked, break_request_status
+          FROM fda_holdings
+          WHERE user_id = $1
+            AND claimed_at IS NULL
+        `,
+        [userId],
+      );
 
     const claimable = [];
     let totalReward = 0;
@@ -6812,6 +6946,7 @@ apiRouter.post('/internal/holdings/start', authMiddleware, async (req, res) => {
     }
 
     const userId = req.user.id;
+    const hasWalletScopedHoldings = await hasFdaHoldingsWalletAddressColumn();
     const minAmount =
       holdPlan === 'merchant_buy'
         ? Math.max(10, await getNumericSetting('holding_reward_min_amount_merchant_buy', 10))
@@ -6834,7 +6969,7 @@ apiRouter.post('/internal/holdings/start', authMiddleware, async (req, res) => {
 
     if (holdSnap.usableBalance < amountNum) {
       return res.status(400).json({
-        error: `Insufficient usable balance for holding start on this wallet. Usable ${holdSnap.usableBalance.toFixed(18)} FDA (internal balance on the selected address ${holdSnap.totalBalance.toFixed(18)} FDA, minus active holds and reserve). Open sell offers already reduced the wallets that posted them. Requested ${amountNum} FDA.`,
+        error: `Insufficient usable balance for holding start on this wallet. Usable ${holdSnap.usableBalance.toFixed(18)} FDA = balance ${holdSnap.totalBalance.toFixed(18)} - holds ${holdSnap.activeHoldingLocked.toFixed(18)} - reserve ${holdSnap.holdingReserveAmount.toFixed(18)}. Requested ${amountNum} FDA.`,
       });
     }
 
@@ -6842,14 +6977,23 @@ apiRouter.post('/internal/holdings/start', authMiddleware, async (req, res) => {
     const holdingPeriod = `${rewardPeriodMonths}M`;
     const expiresAt = calculateExpirationDate(holdingPeriod);
     const lockedRewardValue = fdaPrice > 0 ? Number(((amountNum * fdaPrice * rewardRate) / 100).toFixed(8)) : 0;
-    const insertResult = await db.query(
-      `
-        INSERT INTO fda_holdings (user_id, holding_plan, amount, holding_period, expires_at, reward_rate, base_fda_price, reward_value_locked, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
-        RETURNING id, user_id, holding_plan, amount, holding_period, expires_at, reward_rate, base_fda_price, reward_value_locked, created_at, claimed_at
-      `,
-      [userId, holdPlan, amountNum, holdingPeriod, expiresAt, rewardRate, fdaPrice > 0 ? fdaPrice : null, lockedRewardValue > 0 ? lockedRewardValue : null, now],
-    );
+    const insertResult = hasWalletScopedHoldings
+      ? await db.query(
+        `
+          INSERT INTO fda_holdings (user_id, wallet_address, holding_plan, amount, holding_period, expires_at, reward_rate, base_fda_price, reward_value_locked, created_at, updated_at)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
+          RETURNING id, user_id, wallet_address, holding_plan, amount, holding_period, expires_at, reward_rate, base_fda_price, reward_value_locked, created_at, claimed_at
+        `,
+        [userId, walletAddress, holdPlan, amountNum, holdingPeriod, expiresAt, rewardRate, fdaPrice > 0 ? fdaPrice : null, lockedRewardValue > 0 ? lockedRewardValue : null, now],
+      )
+      : await db.query(
+        `
+          INSERT INTO fda_holdings (user_id, holding_plan, amount, holding_period, expires_at, reward_rate, base_fda_price, reward_value_locked, created_at, updated_at)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
+          RETURNING id, user_id, holding_plan, amount, holding_period, expires_at, reward_rate, base_fda_price, reward_value_locked, created_at, claimed_at
+        `,
+        [userId, holdPlan, amountNum, holdingPeriod, expiresAt, rewardRate, fdaPrice > 0 ? fdaPrice : null, lockedRewardValue > 0 ? lockedRewardValue : null, now],
+      );
     const holding = insertResult.rows[0];
     const rewardAmount = fdaPrice > 0
       ? Number((lockedRewardValue / fdaPrice).toFixed(18))
@@ -6865,6 +7009,9 @@ apiRouter.post('/internal/holdings/start', authMiddleware, async (req, res) => {
       holding: {
         id: holding.id,
         userId: holding.user_id,
+        walletAddress: (hasWalletScopedHoldings && holding.wallet_address)
+          ? String(holding.wallet_address).toLowerCase()
+          : walletAddress,
         plan: holding.holding_plan || holdPlan,
         amount: parseFloat(holding.amount),
         holdingPeriod: holding.holding_period,
