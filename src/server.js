@@ -357,11 +357,14 @@ async function getP2PMinPricePerFdaForFiat(fiatNorm, defaultValue = 1) {
   return getP2PMinPricePerFda(defaultValue);
 }
 
+function normalizeHoldingPlan(rawPlan) {
+  const p = String(rawPlan || 'standard').toLowerCase().trim().replace(/[-\s]+/g, '_');
+  return p === 'merchant_buy' ? 'merchant_buy' : 'standard';
+}
+
 async function evaluateHoldingRewardEligibility(userId, holding, settings) {
   const amount = parseFloat(holding.amount || 0);
-  const holdingPlan = String(holding.holding_plan || 'standard').toLowerCase() === 'merchant_buy'
-    ? 'merchant_buy'
-    : 'standard';
+  const holdingPlan = normalizeHoldingPlan(holding.holding_plan);
   const fallbackRate = holdingPlan === 'merchant_buy'
     ? settings.merchantBuyRewardRate
     : settings.rewardRate;
@@ -2851,18 +2854,18 @@ apiRouter.post('/trades', authMiddleware, async (req, res) => {
 
     await db.prepare(`
       INSERT INTO internal_balances
-      (user_id,wallet_address,fda_balance,updated_at)
-      VALUES (?, ?, 0, CURRENT_TIMESTAMP)
+      (wallet_address,fda_balance,updated_at)
+      VALUES (?, 0, CURRENT_TIMESTAMP)
       ON CONFLICT DO NOTHING
-    `).run(buyerId, buyerWalletAddress);
+    `).run(buyerWalletAddress);
 
 
     await db.prepare(`
       INSERT INTO internal_balances
-      (user_id,wallet_address,fda_balance,updated_at)
-      VALUES (?, ?, 0, CURRENT_TIMESTAMP)
+      (wallet_address,fda_balance,updated_at)
+      VALUES (?, 0, CURRENT_TIMESTAMP)
       ON CONFLICT DO NOTHING
-    `).run(sellerId, sellerWalletAddress);
+    `).run(sellerWalletAddress);
 
 
 
@@ -3282,10 +3285,9 @@ apiRouter.post('/trades/:id/release', authMiddleware, async (req, res) => {
 
         await db.prepare(`
           INSERT INTO internal_balances
-          (user_id, wallet_address, fda_balance, updated_at)
-          VALUES (?, ?, 0, ?)
+          (wallet_address, fda_balance, updated_at)
+          VALUES (?, 0, ?)
         `).run(
-          trade.buyer_id,
           buyerAddress,
           now
         );
@@ -6736,32 +6738,43 @@ async function getHoldingUsableSnapshot(userId, primaryWalletAddress) {
 }
 
 async function isMerchantBuyEligible(userId) {
-  // Admin override column on users table.
+  // Merchant Buy eligibility:
+  // 1) Persistent user flag allows direct access (no repeated live recalculation).
+  // 2) If flag is not set yet, check completed FDA buy total once; if >=10, persist flag.
   try {
-    const userResult = await db.query(
+    const flagged = await db.query(
       'SELECT merchant_buy_eligible FROM users WHERE id = $1 LIMIT 1',
       [userId],
     );
-    const flag = Number(userResult.rows?.[0]?.merchant_buy_eligible || 0);
-    if (flag === 1) return true;
-  } catch {
-    // continue with behavioral check
+    if (Number(flagged.rows?.[0]?.merchant_buy_eligible || 0) === 1) return true;
+  } catch (_err) {
+    // continue to fallback calculation
   }
 
-  // Behavioral eligibility: user must have at least one completed FDA buy trade.
-  const completedBuyResult = await db.query(
-    `
-      SELECT 1
-      FROM trades t
-      LEFT JOIN offers o ON o.id = t.offer_id
-      WHERE t.buyer_id = $1
-        AND t.status = 'COMPLETED'
-        AND UPPER(COALESCE(t.asset_symbol, o.asset_symbol, 'FDA')) = 'FDA'
-      LIMIT 1
-    `,
-    [userId],
-  );
-  return Boolean(completedBuyResult.rows?.[0]);
+  try {
+    const completedBuyResult = await db.query(
+      `
+        SELECT COALESCE(SUM(CAST(t.amount AS DOUBLE PRECISION)), 0) AS total_fda
+        FROM trades t
+        LEFT JOIN offers o ON o.id = t.offer_id
+        WHERE t.buyer_id = $1
+          AND UPPER(COALESCE(t.asset_symbol, o.asset_symbol, 'FDA')) = 'FDA'
+          AND UPPER(COALESCE(t.status, '')) = 'COMPLETED'
+      `,
+      [userId],
+    );
+    const total = Number(completedBuyResult.rows?.[0]?.total_fda || 0);
+    const eligibleNow = Number.isFinite(total) && total >= 10;
+    if (eligibleNow) {
+      await db.query(
+        'UPDATE users SET merchant_buy_eligible = 1 WHERE id = $1',
+        [userId],
+      );
+    }
+    return eligibleNow;
+  } catch (_err) {
+    return false;
+  }
 }
 
 apiRouter.get('/internal/holdings/reward-status', authMiddleware, async (_req, res) => {
@@ -6809,7 +6822,7 @@ apiRouter.get('/internal/holdings/reward-status', authMiddleware, async (_req, r
       if (eligibility.eligible) pendingReward += eligibility.rewardAmount;
       holdings.push({
         id: holding.id,
-        plan: eligibility.holdingPlan || 'standard',
+        plan: normalizeHoldingPlan(holding.holding_plan),
         walletAddress: hasWalletScopedHoldings && holding.wallet_address ? String(holding.wallet_address).toLowerCase() : null,
         amount: parseFloat(holding.amount),
         holdingPeriod: holding.holding_period,
@@ -7050,7 +7063,29 @@ apiRouter.post('/internal/holdings/start', authMiddleware, async (req, res) => {
       const merchantEligible = await isMerchantBuyEligible(userId);
       if (!merchantEligible) {
         return res.status(403).json({
-          error: 'Merchant Buy hold is allowed only for users with completed FDA buy history on MerchantCoinWallet.',
+          error: 'Merchant Buy hold is allowed only for users who completed at least 10 FDA buy on MerchantCoinWallet.',
+        });
+      }
+      if (amountNum > 50) {
+        return res.status(400).json({
+          error: 'Merchant Buy hold maximum amount is 50 FDA per user.',
+        });
+      }
+      const activeMerchantHoldingResult = await db.query(
+        `
+          SELECT COALESCE(SUM(amount), 0) AS total
+          FROM fda_holdings
+          WHERE user_id = $1
+            AND LOWER(COALESCE(holding_plan, 'standard')) = 'merchant_buy'
+            AND claimed_at IS NULL
+            AND UPPER(COALESCE(break_request_status, 'NONE')) <> 'APPROVED'
+        `,
+        [userId],
+      );
+      const activeMerchantTotal = Number(activeMerchantHoldingResult.rows?.[0]?.total || 0);
+      if (activeMerchantTotal + amountNum > 50) {
+        return res.status(400).json({
+          error: `Merchant Buy total active holding limit is 50 FDA per user. Current active Merchant holds: ${activeMerchantTotal.toFixed(8)} FDA.`,
         });
       }
     }
@@ -7072,11 +7107,15 @@ apiRouter.post('/internal/holdings/start', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: `Minimum hold amount for ${holdPlan === 'merchant_buy' ? 'Merchant Buy' : 'Standard'} plan is ${minAmount} FDA.` });
     }
 
-    const holdSnap = await getHoldingUsableSnapshot(userId, walletAddress);
+    // Merchant Buy is user-scoped: evaluate usable FDA across all wallets (not just selected wallet).
+    const holdSnap = await getHoldingUsableSnapshot(
+      userId,
+      holdPlan === 'merchant_buy' ? null : walletAddress,
+    );
 
     if (holdSnap.usableBalance < amountNum) {
       return res.status(400).json({
-        error: `Insufficient usable balance for holding start on this wallet. Usable ${holdSnap.usableBalance.toFixed(18)} FDA = balance ${holdSnap.totalBalance.toFixed(18)} - holds ${holdSnap.activeHoldingLocked.toFixed(18)} - reserve ${holdSnap.holdingReserveAmount.toFixed(18)}. Requested ${amountNum} FDA.`,
+        error: `Insufficient usable balance for holding start ${holdPlan === 'merchant_buy' ? 'for user total wallets' : 'on this wallet'}. Usable ${holdSnap.usableBalance.toFixed(18)} FDA = balance ${holdSnap.totalBalance.toFixed(18)} - holds ${holdSnap.activeHoldingLocked.toFixed(18)} - reserve ${holdSnap.holdingReserveAmount.toFixed(18)}. Requested ${amountNum} FDA.`,
       });
     }
 
@@ -7119,7 +7158,7 @@ apiRouter.post('/internal/holdings/start', authMiddleware, async (req, res) => {
         walletAddress: (hasWalletScopedHoldings && holding.wallet_address)
           ? String(holding.wallet_address).toLowerCase()
           : walletAddress,
-        plan: holding.holding_plan || holdPlan,
+        plan: normalizeHoldingPlan(holding.holding_plan || holdPlan),
         amount: parseFloat(holding.amount),
         holdingPeriod: holding.holding_period,
         expiresAt: holding.expires_at,
@@ -7917,13 +7956,17 @@ apiRouter.post('/fda/transfer-to-mc-wallet', validateFDAOrigin, validateAPIKey, 
 
     
 
-    // Get current balance
-
-    let balanceRow = await db
-
-      .prepare('SELECT fda_balance FROM internal_balances WHERE user_id = ?')
-
+    // Get user's primary wallet and current wallet-scoped balance
+    const primaryWallet = await db
+      .prepare('SELECT address FROM wallets WHERE user_id = ? ORDER BY created_at ASC LIMIT 1')
       .get(localUserId);
+    const primaryWalletAddress = String(primaryWallet?.address || '').trim().toLowerCase();
+    if (!primaryWalletAddress) {
+      return res.status(400).json({ error: 'No wallet found for this user. Please register/import wallet first.' });
+    }
+    let balanceRow = await db
+      .prepare('SELECT fda_balance FROM internal_balances WHERE LOWER(wallet_address) = LOWER(?)')
+      .get(primaryWalletAddress);
 
 
 
@@ -7938,10 +7981,8 @@ apiRouter.post('/fda/transfer-to-mc-wallet', validateFDAOrigin, validateAPIKey, 
       // Create new balance record
 
       await db
-
-        .prepare('INSERT INTO internal_balances (user_id, fda_balance, updated_at) VALUES (?, ?, ?)')
-
-        .run(localUserId, amountNum, now);
+        .prepare('INSERT INTO internal_balances (wallet_address, fda_balance, updated_at) VALUES (?, ?, ?)')
+        .run(primaryWalletAddress, amountNum, now);
 
       console.log(`[FDA API] ✅ Created new balance record: ${amountNum} FDA`);
 
@@ -7950,10 +7991,8 @@ apiRouter.post('/fda/transfer-to-mc-wallet', validateFDAOrigin, validateAPIKey, 
       // Update existing balance (add amount)
 
       await db
-
-        .prepare('UPDATE internal_balances SET fda_balance = fda_balance + ?, updated_at = ? WHERE user_id = ?')
-
-        .run(amountNum, now, localUserId);
+        .prepare('UPDATE internal_balances SET fda_balance = fda_balance + ?, updated_at = ? WHERE LOWER(wallet_address) = LOWER(?)')
+        .run(amountNum, now, primaryWalletAddress);
 
       
 
@@ -8010,10 +8049,8 @@ apiRouter.post('/fda/transfer-to-mc-wallet', validateFDAOrigin, validateAPIKey, 
     // Get final balance
 
     balanceRow = await db
-
-      .prepare('SELECT fda_balance FROM internal_balances WHERE user_id = ?')
-
-      .get(localUserId);
+      .prepare('SELECT fda_balance FROM internal_balances WHERE LOWER(wallet_address) = LOWER(?)')
+      .get(primaryWalletAddress);
 
 
 
