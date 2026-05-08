@@ -6737,20 +6737,9 @@ async function getHoldingUsableSnapshot(userId, primaryWalletAddress) {
   };
 }
 
-async function isMerchantBuyEligible(userId) {
-  // Merchant Buy eligibility:
-  // 1) Persistent user flag allows direct access (no repeated live recalculation).
-  // 2) If flag is not set yet, check completed FDA buy total once; if >=10, persist flag.
-  try {
-    const flagged = await db.query(
-      'SELECT merchant_buy_eligible FROM users WHERE id = $1 LIMIT 1',
-      [userId],
-    );
-    if (Number(flagged.rows?.[0]?.merchant_buy_eligible || 0) === 1) return true;
-  } catch (_err) {
-    // continue to fallback calculation
-  }
-
+async function getCompletedMerchantBuyAmountForWallet(userId, walletAddress) {
+  const wallet = String(walletAddress || '').toLowerCase().trim();
+  if (!wallet) return 0;
   try {
     const completedBuyResult = await db.query(
       `
@@ -6758,23 +6747,22 @@ async function isMerchantBuyEligible(userId) {
         FROM trades t
         LEFT JOIN offers o ON o.id = t.offer_id
         WHERE t.buyer_id = $1
+          AND LOWER(TRIM(COALESCE(t.buyer_wallet_address, ''))) = LOWER(TRIM($2))
           AND UPPER(COALESCE(t.asset_symbol, o.asset_symbol, 'FDA')) = 'FDA'
           AND UPPER(COALESCE(t.status, '')) = 'COMPLETED'
       `,
-      [userId],
+      [userId, wallet],
     );
     const total = Number(completedBuyResult.rows?.[0]?.total_fda || 0);
-    const eligibleNow = Number.isFinite(total) && total >= 10;
-    if (eligibleNow) {
-      await db.query(
-        'UPDATE users SET merchant_buy_eligible = 1 WHERE id = $1',
-        [userId],
-      );
-    }
-    return eligibleNow;
+    return Number.isFinite(total) ? total : 0;
   } catch (_err) {
-    return false;
+    return 0;
   }
+}
+
+async function isMerchantBuyEligibleForWallet(userId, walletAddress) {
+  const totalBought = await getCompletedMerchantBuyAmountForWallet(userId, walletAddress);
+  return totalBought >= 10;
 }
 
 apiRouter.get('/internal/holdings/reward-status', authMiddleware, async (_req, res) => {
@@ -6791,7 +6779,9 @@ apiRouter.get('/internal/holdings/reward-status', authMiddleware, async (_req, r
       merchantBuyRewardPeriodMonths: await getNumericSetting('holding_reward_period_months_merchant_buy', 12),
       fdaPrice: await getNumericSetting('fda_price', 0),
     };
-    const merchantBuyEligible = await isMerchantBuyEligible(userId);
+    const merchantBuyEligible = qWallet
+      ? await isMerchantBuyEligibleForWallet(userId, qWallet)
+      : false;
     const holdingsResult = (qWallet && hasWalletScopedHoldings)
       ? await db.query(
         `
@@ -7060,17 +7050,18 @@ apiRouter.post('/internal/holdings/start', authMiddleware, async (req, res) => {
     const userId = req.user.id;
     const hasWalletScopedHoldings = await hasFdaHoldingsWalletAddressColumn();
     if (holdPlan === 'merchant_buy') {
-      const merchantEligible = await isMerchantBuyEligible(userId);
+      const merchantEligible = await isMerchantBuyEligibleForWallet(userId, walletAddress);
       if (!merchantEligible) {
         return res.status(403).json({
-          error: 'Merchant Buy hold is allowed only for users who completed at least 10 FDA buy on MerchantCoinWallet.',
+          error: 'Merchant Buy hold is allowed only on wallets that completed at least 10 FDA buy on MerchantCoinWallet.',
         });
       }
       if (amountNum > 50) {
         return res.status(400).json({
-          error: 'Merchant Buy hold maximum amount is 50 FDA per user.',
+          error: 'Merchant Buy hold maximum amount is 50 FDA per wallet.',
         });
       }
+      const merchantBoughtAmount = await getCompletedMerchantBuyAmountForWallet(userId, walletAddress);
       const activeMerchantHoldingResult = await db.query(
         `
           SELECT COALESCE(SUM(amount), 0) AS total
@@ -7079,13 +7070,20 @@ apiRouter.post('/internal/holdings/start', authMiddleware, async (req, res) => {
             AND LOWER(COALESCE(holding_plan, 'standard')) = 'merchant_buy'
             AND claimed_at IS NULL
             AND UPPER(COALESCE(break_request_status, 'NONE')) <> 'APPROVED'
+            ${hasWalletScopedHoldings ? "AND LOWER(TRIM(COALESCE(wallet_address, ''))) = LOWER(TRIM($2))" : ''}
         `,
-        [userId],
+        hasWalletScopedHoldings ? [userId, walletAddress] : [userId],
       );
       const activeMerchantTotal = Number(activeMerchantHoldingResult.rows?.[0]?.total || 0);
       if (activeMerchantTotal + amountNum > 50) {
         return res.status(400).json({
-          error: `Merchant Buy total active holding limit is 50 FDA per user. Current active Merchant holds: ${activeMerchantTotal.toFixed(8)} FDA.`,
+          error: `Merchant Buy total active holding limit is 50 FDA per wallet. Current active Merchant holds on this wallet: ${activeMerchantTotal.toFixed(8)} FDA.`,
+        });
+      }
+      const remainingBuyBackedCapacity = Math.max(0, merchantBoughtAmount - activeMerchantTotal);
+      if (amountNum > remainingBuyBackedCapacity) {
+        return res.status(400).json({
+          error: `Merchant Buy hold must be backed by completed MerchantCoinWallet buys on this wallet. Remaining eligible amount: ${remainingBuyBackedCapacity.toFixed(8)} FDA (completed buys ${merchantBoughtAmount.toFixed(8)} - active merchant holds ${activeMerchantTotal.toFixed(8)}).`,
         });
       }
     }
@@ -7107,15 +7105,15 @@ apiRouter.post('/internal/holdings/start', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: `Minimum hold amount for ${holdPlan === 'merchant_buy' ? 'Merchant Buy' : 'Standard'} plan is ${minAmount} FDA.` });
     }
 
-    // Merchant Buy is user-scoped: evaluate usable FDA across all wallets (not just selected wallet).
+    // Hold usable check is wallet-scoped.
     const holdSnap = await getHoldingUsableSnapshot(
       userId,
-      holdPlan === 'merchant_buy' ? null : walletAddress,
+      walletAddress,
     );
 
     if (holdSnap.usableBalance < amountNum) {
       return res.status(400).json({
-        error: `Insufficient usable balance for holding start ${holdPlan === 'merchant_buy' ? 'for user total wallets' : 'on this wallet'}. Usable ${holdSnap.usableBalance.toFixed(18)} FDA = balance ${holdSnap.totalBalance.toFixed(18)} - holds ${holdSnap.activeHoldingLocked.toFixed(18)} - reserve ${holdSnap.holdingReserveAmount.toFixed(18)}. Requested ${amountNum} FDA.`,
+        error: `Insufficient usable balance for holding start on this wallet. Usable ${holdSnap.usableBalance.toFixed(18)} FDA = balance ${holdSnap.totalBalance.toFixed(18)} - holds ${holdSnap.activeHoldingLocked.toFixed(18)} - reserve ${holdSnap.holdingReserveAmount.toFixed(18)}. Requested ${amountNum} FDA.`,
       });
     }
 
