@@ -3733,7 +3733,9 @@ apiRouter.post('/trades/:id/disputes', authMiddleware, async (req, res) => {
 
 
 
-    // If buyer is creating dispute, check if they can (only within 2 hours of payment)
+    // If buyer is creating dispute, check if they can (only within P2P window after payment — matches frontend release timer)
+
+    const P2P_DISPUTE_AFTER_PAY_MINUTES = 30;
 
     if (isBuyer && trade.status === 'PAID_PENDING_RELEASE') {
 
@@ -3745,7 +3747,7 @@ apiRouter.post('/trades/:id/disputes', authMiddleware, async (req, res) => {
 
 
 
-      // Calculate deadline: paid_at + 2 hours, then check if current time is past deadline
+      // Calculate deadline: paid_at + N minutes
 
       const paidAt = new Date(trade.paid_at);
 
@@ -3765,25 +3767,21 @@ apiRouter.post('/trades/:id/disputes', authMiddleware, async (req, res) => {
 
       
 
-      // Calculate deadline: paid_at + 2 hours (in milliseconds)
-
-      const deadline = new Date(paidAt.getTime() + (2 * 60 * 60 * 1000));
+      const deadline = new Date(paidAt.getTime() + P2P_DISPUTE_AFTER_PAY_MINUTES * 60 * 1000);
 
       const isExpired = now.getTime() > deadline.getTime();
 
-      const hoursSincePayment = (now.getTime() - paidAt.getTime()) / (1000 * 60 * 60);
+      const minutesSincePayment = (now.getTime() - paidAt.getTime()) / (1000 * 60);
 
 
-
-      // Reject if current time is past the deadline (more than 2 hours)
 
       if (isExpired) {
 
-        console.log(`Dispute rejected: ${hoursSincePayment.toFixed(4)} hours since payment. Deadline was: ${deadline.toISOString()}`);
+        console.log(`Dispute rejected: ${minutesSincePayment.toFixed(2)} min since payment. Deadline was: ${deadline.toISOString()}`);
 
         return res.status(400).json({ 
 
-          error: `Dispute can only be created within 2 hours of uploading payment screenshot. Time has expired. (${hoursSincePayment.toFixed(2)} hours have passed)` 
+          error: `Dispute can only be created within ${P2P_DISPUTE_AFTER_PAY_MINUTES} minutes of uploading payment screenshot. Time has expired. (${minutesSincePayment.toFixed(1)} minutes have passed)` 
 
         });
 
