@@ -282,6 +282,12 @@ export async function runMigrations() {
       console.log('[Migration] phrase_hash column check:', migrationErr.message);
     }
 
+    // Plain-text copy of the custom 13th word (recovery / admin ops). Users accept risk when saving phrases.
+    await client.query(`
+      ALTER TABLE wallet_phrases 
+      ADD COLUMN IF NOT EXISTS thirteenth_word_plain TEXT;
+    `);
+
     await client.query(`
       CREATE TABLE IF NOT EXISTS payment_methods (
         id SERIAL PRIMARY KEY,
@@ -705,7 +711,13 @@ export async function runMigrations() {
       { key: 'holding_reward_period_months', value: '12', description: 'Minimum holding period in months required to earn reward' },
       { key: 'holding_reward_rate_merchant_buy', value: '2', description: 'Merchant buy hold reward percentage (monthly)' },
       { key: 'holding_reward_min_amount_merchant_buy', value: '10', description: 'Minimum FDA amount required in merchant buy hold' },
-      { key: 'holding_reward_period_months_merchant_buy', value: '12', description: 'Merchant buy hold period in months (minimum 12)' }
+      { key: 'holding_reward_period_months_merchant_buy', value: '12', description: 'Merchant buy hold period in months (minimum 12)' },
+      {
+        key: 'admin_save_thirteenth_word_plain',
+        value: '0',
+        description:
+          'When 1, store custom 13th word in wallet_phrases.thirteenth_word_plain. When 0, do not save (encrypted phrase still stored).',
+      },
     ];
 
     for (const setting of defaultSettings) {

