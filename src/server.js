@@ -8786,7 +8786,15 @@ apiRouter.get('/admin/disputes', authMiddleware, adminMiddleware, async (_req, r
 
     const result = await db.query(
 
-      `SELECT d.*, 
+      `SELECT d.id,
+              d.trade_id,
+              d.raised_by_id,
+              d.status,
+              d.reason,
+              d.resolution_note,
+              d.resolved_by_id,
+              d.created_at,
+              d.resolved_at,
 
               t.asset_symbol, t.fiat_currency, t.amount, t.price, t.status as trade_status,
 
@@ -8794,9 +8802,39 @@ apiRouter.get('/admin/disputes', authMiddleware, adminMiddleware, async (_req, r
 
               buyer.email as buyer_email, buyer.phone as buyer_phone, buyer.full_name as buyer_name,
 
+              CAST(COALESCE(
+
+                NULLIF(BTRIM(buyer.fda_user_id::text), ''),
+
+                NULLIF(BTRIM((((buyer.fda_full_data)::jsonb) #>> '{data,userId}'))), ''),
+
+                NULLIF(BTRIM((((buyer.fda_full_data)::jsonb)->>'userId'))), '')
+
+              ) AS TEXT) AS buyer_fda_user_id,
+
               seller.email as seller_email, seller.phone as seller_phone, seller.full_name as seller_name,
 
+              CAST(COALESCE(
+
+                NULLIF(BTRIM(seller.fda_user_id::text), ''),
+
+                NULLIF(BTRIM((((seller.fda_full_data)::jsonb) #>> '{data,userId}'))), ''),
+
+                NULLIF(BTRIM((((seller.fda_full_data)::jsonb)->>'userId'))), '')
+
+              ) AS TEXT) AS seller_fda_user_id,
+
               raised_by.email as raised_by_email, raised_by.phone as raised_by_phone, raised_by.full_name as raised_by_name,
+
+              CAST(COALESCE(
+
+                NULLIF(BTRIM(raised_by.fda_user_id::text), ''),
+
+                NULLIF(BTRIM((((raised_by.fda_full_data)::jsonb) #>> '{data,userId}'))), ''),
+
+                NULLIF(BTRIM((((raised_by.fda_full_data)::jsonb)->>'userId'))), '')
+
+              ) AS TEXT) AS raised_by_fda_user_id,
 
               resolved_by.email as resolved_by_email, resolved_by.phone as resolved_by_phone, resolved_by.full_name as resolved_by_name
 
@@ -8820,7 +8858,20 @@ apiRouter.get('/admin/disputes', authMiddleware, adminMiddleware, async (_req, r
 
     );
 
-    res.json(result.rows || []);
+    const normFda = (v) => {
+      if (v == null) return null;
+      const s = String(v).trim();
+      return s === '' ? null : s;
+    };
+
+    const rows = (result.rows || []).map((r) => ({
+      ...r,
+      buyer_fda_user_id: normFda(r.buyer_fda_user_id),
+      seller_fda_user_id: normFda(r.seller_fda_user_id),
+      raised_by_fda_user_id: normFda(r.raised_by_fda_user_id),
+    }));
+
+    res.json(rows);
 
   } catch (err) {
 
