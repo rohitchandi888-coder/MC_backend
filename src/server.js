@@ -2788,6 +2788,22 @@ apiRouter.post('/trades', authMiddleware, async (req, res) => {
       });
     }
 
+    const activeTrade = await db
+      .prepare(
+        `SELECT id, status FROM trades
+         WHERE (buyer_id = ? OR seller_id = ?)
+           AND UPPER(TRIM(COALESCE(status, ''))) NOT IN ('COMPLETED', 'CANCELLED')
+         ORDER BY id DESC
+         LIMIT 1`,
+      )
+      .get(req.user.id, req.user.id);
+
+    if (activeTrade) {
+      return res.status(400).json({
+        error: `You already have an active trade (#${activeTrade.id}, status: ${activeTrade.status}). Finish or cancel it before accepting another offer.`,
+      });
+    }
+
 
     const buyerId =
       offer.type === "BUY"
@@ -8795,6 +8811,8 @@ apiRouter.get('/admin/disputes', authMiddleware, adminMiddleware, async (_req, r
        JOIN users raised_by ON raised_by.id = d.raised_by_id
 
        LEFT JOIN users resolved_by ON resolved_by.id = d.resolved_by_id
+
+       WHERE UPPER(TRIM(COALESCE(d.status, ''))) = 'OPEN'
 
        ORDER BY d.created_at DESC
 
