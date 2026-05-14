@@ -8803,37 +8803,25 @@ apiRouter.get('/admin/disputes', authMiddleware, adminMiddleware, async (_req, r
               buyer.email as buyer_email, buyer.phone as buyer_phone, buyer.full_name as buyer_name,
 
               CAST(COALESCE(
-
-                NULLIF(BTRIM(buyer.fda_user_id::text), ''),
-
-                NULLIF(BTRIM((((buyer.fda_full_data)::jsonb) #>> '{data,userId}'))), ''),
-
-                NULLIF(BTRIM((((buyer.fda_full_data)::jsonb)->>'userId'))), '')
-
+                NULLIF(TRIM(BOTH FROM COALESCE(buyer.fda_user_id::text, '')), ''),
+                NULLIF(TRIM(BOTH FROM COALESCE(buyer.fda_full_data #>> '{data,userId}', '')), ''),
+                NULLIF(TRIM(BOTH FROM COALESCE(buyer.fda_full_data->>'userId', '')), '')
               ) AS TEXT) AS buyer_fda_user_id,
 
               seller.email as seller_email, seller.phone as seller_phone, seller.full_name as seller_name,
 
               CAST(COALESCE(
-
-                NULLIF(BTRIM(seller.fda_user_id::text), ''),
-
-                NULLIF(BTRIM((((seller.fda_full_data)::jsonb) #>> '{data,userId}'))), ''),
-
-                NULLIF(BTRIM((((seller.fda_full_data)::jsonb)->>'userId'))), '')
-
+                NULLIF(TRIM(BOTH FROM COALESCE(seller.fda_user_id::text, '')), ''),
+                NULLIF(TRIM(BOTH FROM COALESCE(seller.fda_full_data #>> '{data,userId}', '')), ''),
+                NULLIF(TRIM(BOTH FROM COALESCE(seller.fda_full_data->>'userId', '')), '')
               ) AS TEXT) AS seller_fda_user_id,
 
               raised_by.email as raised_by_email, raised_by.phone as raised_by_phone, raised_by.full_name as raised_by_name,
 
               CAST(COALESCE(
-
-                NULLIF(BTRIM(raised_by.fda_user_id::text), ''),
-
-                NULLIF(BTRIM((((raised_by.fda_full_data)::jsonb) #>> '{data,userId}'))), ''),
-
-                NULLIF(BTRIM((((raised_by.fda_full_data)::jsonb)->>'userId'))), '')
-
+                NULLIF(TRIM(BOTH FROM COALESCE(raised_by.fda_user_id::text, '')), ''),
+                NULLIF(TRIM(BOTH FROM COALESCE(raised_by.fda_full_data #>> '{data,userId}', '')), ''),
+                NULLIF(TRIM(BOTH FROM COALESCE(raised_by.fda_full_data->>'userId', '')), '')
               ) AS TEXT) AS raised_by_fda_user_id,
 
               resolved_by.email as resolved_by_email, resolved_by.phone as resolved_by_phone, resolved_by.full_name as resolved_by_name
