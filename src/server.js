@@ -10,6 +10,8 @@ import jwt from 'jsonwebtoken';
 
 import crypto from 'crypto';
 
+import https from 'node:https';
+
 import { db, runMigrations } from './db.js';
 
 
@@ -21,6 +23,217 @@ const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || 'change-me-in-production';
 
 const FDA_API_KEY = process.env.FDA_API_KEY || 'fda-mc-wallet-api-key-2024'; // API key for futuredigiassets.com
+
+const FDA_OTP_VERIFY_URL =
+  process.env.FDA_OTP_VERIFY_URL || 'https://futuredigiassets.com/req/ajaxfunction-dynamic/';
+
+const FDA_OTP_ORIGIN_HEADER =
+  process.env.FDA_OTP_ORIGIN_HEADER || 'hkH@1g^g4%ef!&8)g6(*h3fF';
+
+/**
+ * POST to futuredigiassets ajaxfunction-dynamic. Uses node:https (not fetch) because
+ * fetch/undici treats "Origin" as a forbidden header and would NOT send the FDA secret.
+ */
+function postFdaAjaxDynamic(formBody) {
+  const url = new URL(FDA_OTP_VERIFY_URL);
+  const body = String(formBody);
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: url.hostname,
+        port: url.port || 443,
+        path: `${url.pathname}${url.search}`,
+        method: 'POST',
+        headers: {
+          Origin: FDA_OTP_ORIGIN_HEADER,
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Content-Length': Buffer.byteLength(body),
+        },
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => {
+          resolve({
+            status: res.statusCode || 0,
+            body: Buffer.concat(chunks).toString('utf8'),
+          });
+        });
+      },
+    );
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+const postFdaOtpVerify = postFdaAjaxDynamic;
+
+const FDA_LIVE_PRICE_CACHE_MS = Number(process.env.FDA_LIVE_PRICE_CACHE_MS || 60_000);
+const FDA_PRICE_AUTO_SYNC_MS = Number(process.env.FDA_PRICE_AUTO_SYNC_MS || 30 * 60 * 1000);
+let fdaLivePriceCache = { price: null, fetchedAt: 0 };
+let fdaPriceAutoSyncTimer = null;
+let lastFdaPriceAutoSyncAt = null;
+let lastFdaPriceAutoSyncError = null;
+
+/** @returns {number|null} */
+function parseFdaCurrentPriceResponse(responseText) {
+  const raw = String(responseText || '').trim();
+  if (!raw) return null;
+
+  const direct = parseFloat(raw);
+  if (Number.isFinite(direct) && direct > 0) return direct;
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed === 'number' && Number.isFinite(parsed) && parsed > 0) return parsed;
+    if (typeof parsed === 'string') {
+      const n = parseFloat(parsed);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+    if (parsed && typeof parsed === 'object') {
+      const candidates = [
+        parsed.price,
+        parsed.data,
+        parsed.currentPrice,
+        parsed.fda_price,
+        parsed.fdaPrice,
+        parsed.value,
+        parsed.rate,
+      ];
+      for (const c of candidates) {
+        const n = parseFloat(c);
+        if (Number.isFinite(n) && n > 0) return n;
+      }
+    }
+  } catch {
+    /* plain text */
+  }
+
+  const embedded = raw.match(/[\d]+(?:\.\d+)?/);
+  if (embedded) {
+    const n = parseFloat(embedded[0]);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return null;
+}
+
+async function fetchFdaLivePrice({ bypassCache = false } = {}) {
+  const now = Date.now();
+  if (
+    !bypassCache &&
+    fdaLivePriceCache.price != null &&
+    now - fdaLivePriceCache.fetchedAt < FDA_LIVE_PRICE_CACHE_MS
+  ) {
+    return fdaLivePriceCache.price;
+  }
+
+  const { status, body } = await postFdaAjaxDynamic('act=currentPrice');
+  const price = parseFdaCurrentPriceResponse(body);
+  if (!price) {
+    throw new Error(
+      status >= 200 && status < 300
+        ? 'FDA server returned an invalid price.'
+        : `FDA price request failed (HTTP ${status}).`,
+    );
+  }
+  fdaLivePriceCache = { price, fetchedAt: now };
+  return price;
+}
+
+async function persistFdaPriceSetting(price, description) {
+  const value = String(price);
+  const now = new Date().toISOString();
+  const desc = description || 'FDA Price (synced from futuredigiassets.com)';
+  const existing = await db.prepare('SELECT key FROM settings WHERE key = ?').get('fda_price');
+  if (existing) {
+    await db
+      .prepare('UPDATE settings SET value = ?, description = ?, updated_at = ? WHERE key = ?')
+      .run(value, desc, now, 'fda_price');
+  } else {
+    await db
+      .prepare('INSERT INTO settings (key, value, description, updated_at) VALUES (?, ?, ?, ?)')
+      .run('fda_price', value, desc, now);
+  }
+}
+
+async function syncFdaPriceFromRemote({ logLabel = 'sync' } = {}) {
+  const price = await fetchFdaLivePrice({ bypassCache: true });
+  await persistFdaPriceSetting(
+    price,
+    `FDA Price (auto-sync from futuredigiassets.com act=currentPrice)`,
+  );
+  lastFdaPriceAutoSyncAt = new Date().toISOString();
+  lastFdaPriceAutoSyncError = null;
+  console.log(`[FDA price] ${logLabel}: INR.V ${price} at ${lastFdaPriceAutoSyncAt}`);
+  return price;
+}
+
+function startFdaPriceAutoSync() {
+  if (fdaPriceAutoSyncTimer) return;
+
+  const run = () => {
+    void syncFdaPriceFromRemote({ logLabel: 'auto-sync' }).catch((err) => {
+      lastFdaPriceAutoSyncError = err?.message || String(err);
+      console.warn('[FDA price] Auto-sync failed:', lastFdaPriceAutoSyncError);
+    });
+  };
+
+  void run();
+  fdaPriceAutoSyncTimer = setInterval(run, FDA_PRICE_AUTO_SYNC_MS);
+  const mins = Math.round(FDA_PRICE_AUTO_SYNC_MS / 60000);
+  console.log(`[FDA price] Scheduled auto-sync every ${mins} minute(s)`);
+}
+
+/** @returns {{ ok: boolean, message?: string }} */
+function parseFdaOtpVerifyResponse(httpStatus, responseText) {
+  const raw = String(responseText || '').trim();
+  if (!raw) return { ok: false, message: 'Empty response from FDA server.' };
+  if (raw === '1' || raw.toLowerCase() === 'true') return { ok: true };
+  if (raw === '0' || raw.toLowerCase() === 'false') {
+    return { ok: false, message: 'OTP rejected by FDA server.' };
+  }
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed === true || parsed === 1) return { ok: true };
+    if (typeof parsed === 'string') {
+      const s = parsed.toLowerCase();
+      if (s === '1' || s === 'true' || s === 'success' || s === 'valid') return { ok: true };
+      return { ok: false, message: parsed };
+    }
+    if (typeof parsed === 'object' && parsed !== null) {
+      const remoteMsg = parsed.msg || parsed.message || parsed.error;
+      const st = String(parsed.status ?? '').toLowerCase();
+      if (st === 'success' || st === 'ok' || st === '1' || st === 'true') return { ok: true };
+      if (st === 'error' || st === 'failed' || st === '0' || st === 'false') {
+        return { ok: false, message: remoteMsg || 'Invalid OTP' };
+      }
+      if (parsed.success === true || parsed.valid === true || parsed.verified === true) return { ok: true };
+      const msg = String(remoteMsg || '').toLowerCase();
+      if (msg.includes('success') || msg.includes('valid') || msg.includes('verified')) return { ok: true };
+      if (msg.includes('invalid') || msg.includes('fail') || msg.includes('error')) {
+        return { ok: false, message: remoteMsg || 'Invalid OTP' };
+      }
+    }
+  } catch {
+    /* plain text */
+  }
+
+  const lower = raw.toLowerCase();
+  if (lower.includes('invalid') || lower.includes('fail') || lower.includes('error') || lower.includes('wrong')) {
+    return { ok: false, message: raw.slice(0, 200) };
+  }
+  if (
+    httpStatus >= 200 &&
+    httpStatus < 300 &&
+    (lower.includes('success') || lower.includes('verified') || lower.includes('valid'))
+  ) {
+    return { ok: true };
+  }
+  return { ok: false, message: 'Unexpected FDA response.' };
+}
 
 
 
@@ -1489,6 +1702,57 @@ apiRouter.post('/auth/reset-password', async (req, res) => {
 
   }
 
+});
+
+
+
+// Verify FDA Authenticator OTP (proxies futuredigiassets.com — used by Android app before send/release)
+
+apiRouter.post('/auth/fda-otp-verify', authMiddleware, async (req, res) => {
+  const otp = String(req.body?.otp || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '');
+
+  if (otp.length !== 6) {
+    return res.status(400).json({ error: 'Enter a valid 6-character authenticator code.' });
+  }
+
+  const fdaUserId = req.user?.fdaUserId;
+  if (!fdaUserId) {
+    return res.status(400).json({ error: 'FDA User ID is not linked to this account.' });
+  }
+
+  try {
+    const formData = new URLSearchParams();
+    formData.append('act', 'otp_verify');
+    formData.append('validOtp', otp);
+    formData.append('userId', String(fdaUserId));
+
+    const { status: remoteStatus, body: responseText } = await postFdaOtpVerify(formData.toString());
+    const verifyResult = parseFdaOtpVerifyResponse(remoteStatus, responseText);
+
+    if (!verifyResult.ok) {
+      console.warn('[FDA OTP] Verification failed', {
+        userId: fdaUserId,
+        httpStatus: remoteStatus,
+        originHeaderSent: true,
+        body: responseText.slice(0, 300),
+      });
+      const detail = verifyResult.message
+        ? String(verifyResult.message).trim()
+        : 'Invalid authenticator code. Try again.';
+      return res.status(400).json({
+        error: detail.includes('Invalid') ? detail : `Invalid authenticator code: ${detail}`,
+        code: 'FDA_OTP_INVALID',
+      });
+    }
+
+    return res.json({ verified: true });
+  } catch (err) {
+    console.error('[FDA OTP] Remote verify error:', err);
+    return res.status(502).json({ error: 'Unable to reach FDA authenticator service. Try again later.' });
+  }
 });
 
 
@@ -7352,17 +7616,76 @@ apiRouter.post('/internal/holdings/start', authMiddleware, async (req, res) => {
 
 apiRouter.get('/fdaPrice', async (_req, res) => {
   try {
+    let livePrice = null;
+    try {
+      livePrice = await fetchFdaLivePrice();
+    } catch (liveErr) {
+      console.warn('FDA live price unavailable, using database setting:', liveErr?.message || liveErr);
+    }
+
     const setting = await db.prepare('SELECT value FROM settings WHERE key = ?').get('fda_price');
-    const price = setting ? parseFloat(setting.value) : 0;
+    const dbPrice = setting ? parseFloat(setting.value) : 0;
+    const price =
+      livePrice != null && livePrice > 0
+        ? livePrice
+        : Number.isFinite(dbPrice) && dbPrice > 0
+          ? dbPrice
+          : 0;
+
     res.json({
       success: true,
-      price: Number.isFinite(price) ? price : 0,
-      data: Number.isFinite(price) ? price : 0,
+      price,
+      data: price,
+      fda_price: price,
+      source: livePrice != null && livePrice > 0 ? 'fda_live' : 'database',
+      lastAutoSyncAt: lastFdaPriceAutoSyncAt,
+      autoSyncIntervalMs: FDA_PRICE_AUTO_SYNC_MS,
     });
   } catch (err) {
     console.error('Failed to fetch FDA price setting:', err);
     res.status(500).json({ error: 'Failed to fetch FDA price' });
   }
+});
+
+apiRouter.get('/admin/fda-live-price', authMiddleware, adminMiddleware, async (_req, res) => {
+  try {
+    const price = await fetchFdaLivePrice({ bypassCache: true });
+    res.json({ success: true, price, data: price, source: 'fda_live' });
+  } catch (err) {
+    console.error('FDA live price fetch failed:', err);
+    res.status(502).json({
+      error: err?.message || 'Failed to fetch live FDA price from futuredigiassets.com',
+    });
+  }
+});
+
+apiRouter.post('/admin/settings/fda_price/sync', authMiddleware, adminMiddleware, async (_req, res) => {
+  try {
+    const price = await syncFdaPriceFromRemote({ logLabel: 'manual-sync' });
+    res.json({
+      success: true,
+      price,
+      data: price,
+      lastAutoSyncAt: lastFdaPriceAutoSyncAt,
+      autoSyncIntervalMs: FDA_PRICE_AUTO_SYNC_MS,
+      message: 'FDA price synced from futuredigiassets.com',
+    });
+  } catch (err) {
+    console.error('FDA price sync failed:', err);
+    res.status(502).json({
+      error: err?.message || 'Failed to sync FDA price from futuredigiassets.com',
+    });
+  }
+});
+
+apiRouter.get('/admin/fda-price-sync-status', authMiddleware, adminMiddleware, async (_req, res) => {
+  res.json({
+    success: true,
+    lastAutoSyncAt: lastFdaPriceAutoSyncAt,
+    lastAutoSyncError: lastFdaPriceAutoSyncError,
+    autoSyncIntervalMs: FDA_PRICE_AUTO_SYNC_MS,
+    autoSyncIntervalMinutes: Math.round(FDA_PRICE_AUTO_SYNC_MS / 60000),
+  });
 });
 
 apiRouter.get('/admin/settings', authMiddleware, adminMiddleware, async (_req, res) => {
@@ -9731,6 +10054,7 @@ runMigrations()
   })
 
   .then(() => {
+    startFdaPriceAutoSync();
 
     app.listen(PORT, () => {
 
