@@ -677,6 +677,61 @@ app.get('/health', (_req, res) => {
 
 
 
+/** True when FDA remote_login body is an error object (not a user profile). */
+function isFdaLoginErrorPayload(obj) {
+  if (!obj || typeof obj !== 'object') return false;
+  return obj.error === true || obj.error === 1 || String(obj.error).toLowerCase() === 'true';
+}
+
+/** Valid FDA success payload must include a numeric/string userId from FDA (not login username). */
+function extractFdaProfileData(fdaUserData) {
+  if (!fdaUserData || typeof fdaUserData !== 'object') return null;
+  if (isFdaLoginErrorPayload(fdaUserData)) return null;
+  const fdaData =
+    fdaUserData.data && typeof fdaUserData.data === 'object' ? fdaUserData.data : fdaUserData;
+  if (!fdaData || typeof fdaData !== 'object') return null;
+  const userIdRaw = fdaData.userId ?? fdaData.user_id;
+  const userId =
+    userIdRaw != null && String(userIdRaw).trim() !== '' ? String(userIdRaw).trim() : null;
+  if (!userId) return null;
+  return { fdaData, fdaUserId: userId, fdaUserData };
+}
+
+function isValidFdaProfilePayload(fdaUserData) {
+  return extractFdaProfileData(fdaUserData) != null;
+}
+
+/**
+ * Parse FDA remote_login HTTP body. Rejects errors and responses without userId even on HTTP 200.
+ */
+function parseFdaRemoteLoginResponse(responseText) {
+  if (responseText == null || String(responseText).trim() === '') {
+    return { ok: false, message: 'Empty FDA response', parsed: null };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(responseText);
+  } catch {
+    return { ok: false, message: 'Invalid FDA response format', parsed: null };
+  }
+  if (isFdaLoginErrorPayload(parsed)) {
+    const msg = String(parsed.message || '').trim();
+    return {
+      ok: false,
+      message: msg || 'Invalid User ID or Password',
+      parsed,
+    };
+  }
+  if (!isValidFdaProfilePayload(parsed)) {
+    return {
+      ok: false,
+      message: 'FDA response missing user profile',
+      parsed,
+    };
+  }
+  return { ok: true, message: 'OK', parsed };
+}
+
 // Helper function to call remote FDA API
 
 async function getUserFromFDA(username, password) {
@@ -732,30 +787,29 @@ async function getUserFromFDA(username, password) {
 
 
     if (httpCode === 200) {
-
+      const evaluated = parseFdaRemoteLoginResponse(responseText);
+      if (!evaluated.ok) {
+        console.log(`[FDA API] ❌ Login rejected by FDA: ${evaluated.message}`);
+        return {
+          status: false,
+          message: evaluated.message,
+          data: responseText,
+          parsed: evaluated.parsed,
+        };
+      }
       return {
-
         status: true,
-
         message: 'Get User data successfully.',
-
-        data: responseText
-
+        data: responseText,
+        parsed: evaluated.parsed,
       };
-
-    } else {
-
-      return {
-
-        status: false,
-
-        message: 'Unable to connect to remote(FDA) server.',
-
-        data: responseText
-
-      };
-
     }
+
+    return {
+      status: false,
+      message: 'Unable to connect to remote(FDA) server.',
+      data: responseText,
+    };
 
   } catch (error) {
 
@@ -1027,19 +1081,22 @@ apiRouter.post('/auth/login', async (req, res) => {
 
         if (fdaResponse.status) {
 
-            let parsedFDA = null;
-            try {
-              parsedFDA = JSON.parse(fdaResponse.data);
-            } catch (e) {
-              console.log("[FDA] parse failed:", e.message);
+            let parsedFDA = fdaResponse.parsed ?? null;
+            if (!parsedFDA) {
+              try {
+                parsedFDA = JSON.parse(fdaResponse.data);
+              } catch (e) {
+                console.log('[FDA] parse failed:', e.message);
+              }
             }
 
-          // if FDA says invalid credentials → return error, do NOT login
-            if (parsedFDA?.error === true) {
-              console.log(`[AUTH] ❌ FDA rejected credentials: ${parsedFDA.message}`);
+            if (isFdaLoginErrorPayload(parsedFDA) || !isValidFdaProfilePayload(parsedFDA)) {
+              const errMsg =
+                parsedFDA?.message ||
+                (isFdaLoginErrorPayload(parsedFDA) ? 'Invalid credentials' : 'FDA response missing user profile');
+              console.log(`[AUTH] ❌ FDA rejected credentials: ${errMsg}`);
               return res.status(401).json({
-                error: parsedFDA.message || 'Invalid credentials',
-                fdaUserData: parsedFDA
+                error: errMsg,
               });
             }
 
@@ -1138,7 +1195,9 @@ apiRouter.post('/auth/login', async (req, res) => {
 
       console.log(`[AUTH] ❌ Response data:`, fdaResponse.data);
 
-      return res.status(401).json({ error: 'Invalid credentials. Please check your user ID and password.' });
+      return res.status(401).json({
+        error: fdaResponse.message || 'Invalid credentials. Please check your user ID and password.',
+      });
 
     }
 
@@ -1150,11 +1209,14 @@ apiRouter.post('/auth/login', async (req, res) => {
 
     try {
 
-      fdaUserData = JSON.parse(fdaResponse.data);
-          /** Error for invalid userid  */
-    // if(fdaUserData.error === true ){
-    //   return res.status(401).json({ error: 'Invalid credentials. Please check your user ID and password.' });
-    // }
+      fdaUserData = fdaResponse.parsed ?? JSON.parse(fdaResponse.data);
+
+      if (isFdaLoginErrorPayload(fdaUserData)) {
+        console.log(`[AUTH] ❌ FDA rejected credentials: ${fdaUserData.message}`);
+        return res.status(401).json({
+          error: fdaUserData.message || 'Invalid credentials. Please check your user ID and password.',
+        });
+      }
 
       console.log(`[FDA API] ✅ Successfully parsed JSON response`);
 
@@ -1166,31 +1228,29 @@ apiRouter.post('/auth/login', async (req, res) => {
 
     } catch (parseError) {
 
-      // If response is not JSON, treat it as successful but log it
+      console.log(`[FDA API] ❌ Failed to parse FDA response:`, parseError.message);
 
-      console.log(`[FDA API] ⚠️  Response is not JSON, parsing error:`, parseError.message);
+      console.log(`[FDA API] ❌ Raw response data:`, fdaResponse.data);
 
-      console.log(`[FDA API] ⚠️  Raw response data:`, fdaResponse.data);
-
-      console.log(`[FDA API] ⚠️  Response type:`, typeof fdaResponse.data);
-
-      console.log(`[FDA API] ⚠️  Response length:`, fdaResponse.data?.length);
-
-      fdaUserData = { id: username, success: true };
-
-      console.log(`[FDA API] ⚠️  Using fallback user data:`, fdaUserData);
-
-      console.log(`\n`);
+      return res.status(401).json({
+        error: 'Invalid FDA response. Account was not created.',
+      });
 
     }
 
+    const fdaProfile = extractFdaProfileData(fdaUserData);
 
+    if (!fdaProfile) {
 
-    // Step 5: Get the data object from FDA response
+      console.log(`[AUTH] ❌ FDA response has no userId — refusing login/register`);
 
-    const fdaData = fdaUserData.data || fdaUserData;
+      return res.status(401).json({
+        error: 'FDA response missing user profile. Account was not created.',
+      });
 
-    const fdaUserIdFromResponse = fdaData.userId ? String(fdaData.userId) : username;
+    }
+
+    const { fdaData, fdaUserId: fdaUserIdFromResponse } = fdaProfile;
 
     
 
@@ -1220,9 +1280,19 @@ apiRouter.post('/auth/login', async (req, res) => {
 
 
 
-    // Step 7: If user still doesn't exist, auto-register them
+    // Step 7: Create local user only after verified FDA success with a real profile
 
     if (!userRow) {
+
+      if (!isValidFdaProfilePayload(fdaUserData)) {
+
+        console.log(`[AUTH] ❌ Refusing auto-register: invalid or error FDA response`);
+
+        return res.status(401).json({
+          error: 'Login failed. Account was not created.',
+        });
+
+      }
 
       console.log(`[AUTH] User ${fdaUserIdFromResponse} not found locally, auto-registering...`);
 
@@ -1276,9 +1346,9 @@ apiRouter.post('/auth/login', async (req, res) => {
 
       
 
-      // Store full FDA data as JSON
+      // Store full FDA profile snapshot only (never error payloads)
 
-      const fdaFullData = JSON.stringify(fdaUserData);
+      const fdaFullData = isFdaLoginErrorPayload(fdaUserData) ? null : JSON.stringify(fdaUserData);
 
       
 
@@ -1438,11 +1508,11 @@ apiRouter.post('/auth/login', async (req, res) => {
 
       const reffId = fdaData.reffId || fdaData.reff_id || null;
 
-      const fdaFullData = JSON.stringify(fdaUserData);
+      const fdaFullData = isFdaLoginErrorPayload(fdaUserData) ? null : JSON.stringify(fdaUserData);
 
       
 
-      // Update user with latest FDA data
+      // Update user with latest FDA data (keep existing fda_full_data if response is not a profile)
 
       await db.query(
 
@@ -1478,7 +1548,7 @@ apiRouter.post('/auth/login', async (req, res) => {
 
           reff_id = COALESCE($15, reff_id),
 
-          fda_full_data = $16
+          fda_full_data = COALESCE($16, fda_full_data)
 
         WHERE id = $17`,
 
