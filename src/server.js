@@ -9232,6 +9232,7 @@ apiRouter.get('/admin/disputes', authMiddleware, adminMiddleware, async (_req, r
        LEFT JOIN users resolved_by ON resolved_by.id = d.resolved_by_id
 
        WHERE UPPER(TRIM(COALESCE(d.status, ''))) = 'OPEN'
+         AND UPPER(TRIM(COALESCE(t.status, ''))) <> 'COMPLETED'
 
        ORDER BY d.created_at DESC
 
