@@ -829,7 +829,105 @@ async function getUserFromFDA(username, password) {
 
 }
 
+function isMissingOrInvalidFdaFullData(value) {
+  if (value == null) return true;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (trimmed === '' || trimmed === 'null') return true;
+    try {
+      return isFdaLoginErrorPayload(JSON.parse(trimmed));
+    } catch {
+      return true;
+    }
+  }
+  if (typeof value === 'object') {
+    return isFdaLoginErrorPayload(value);
+  }
+  return false;
+}
 
+/** Persist FDA remote_login profile onto users row. */
+async function applyFdaProfileToUser(userId, fdaUserData) {
+  const fdaProfile = extractFdaProfileData(fdaUserData);
+  if (!fdaProfile) return null;
+
+  const { fdaData, fdaUserId: fdaUserIdFromResponse } = fdaProfile;
+  let email = fdaData.loginId || null;
+  let phone = fdaData.userMobiTel || null;
+  const fullName = fdaData.userFirstName || null;
+  const dreamerStatus = fdaData.dreamer_status ?? null;
+  const learnerStatus = fdaData.learner_status ?? null;
+  const plainPass = fdaData.plain_pass || null;
+  const plainTpass = fdaData.plain_tpass || null;
+  const dreamerCountStatus = fdaData.dreamer_count_status ?? null;
+  const learnerCountStatus = fdaData.learnerCountStatus ?? null;
+  const userCountry = fdaData.userCountry || null;
+  const userState = fdaData.userState || null;
+  const userCity = fdaData.userCity || null;
+  const inrPriceRaw = fdaData.inr_price != null ? parseFloat(fdaData.inr_price) : null;
+  const inrPrice = Number.isFinite(inrPriceRaw) ? inrPriceRaw : null;
+  const reffId = fdaData.reffId || fdaData.reff_id || null;
+  const fdaFullData = isFdaLoginErrorPayload(fdaUserData) ? null : fdaUserData;
+
+  if (email) {
+    const clash = await db
+      .prepare('SELECT id FROM users WHERE email = ? AND id != ?')
+      .get(email, userId);
+    if (clash) email = null;
+  }
+  if (phone) {
+    const clash = await db
+      .prepare('SELECT id FROM users WHERE phone = ? AND id != ?')
+      .get(phone, userId);
+    if (clash) phone = null;
+  }
+
+  await db.query(
+    `UPDATE users SET
+      fda_user_id = COALESCE($1, fda_user_id),
+      email = COALESCE($2, email),
+      phone = COALESCE($3, phone),
+      full_name = COALESCE($4, full_name),
+      dreamer_status = COALESCE($5, dreamer_status),
+      learner_status = COALESCE($6, learner_status),
+      plain_pass = COALESCE($7, plain_pass),
+      plain_tpass = COALESCE($8, plain_tpass),
+      dreamer_count_status = COALESCE($9, dreamer_count_status),
+      learner_count_status = COALESCE($10, learner_count_status),
+      user_country = COALESCE($11, user_country),
+      user_state = COALESCE($12, user_state),
+      user_city = COALESCE($13, user_city),
+      inr_price = COALESCE($14, inr_price),
+      reff_id = COALESCE($15, reff_id),
+      fda_full_data = COALESCE($16, fda_full_data)
+    WHERE id = $17`,
+    [
+      fdaUserIdFromResponse,
+      email,
+      phone,
+      fullName,
+      dreamerStatus,
+      learnerStatus,
+      plainPass,
+      plainTpass,
+      dreamerCountStatus,
+      learnerCountStatus,
+      userCountry,
+      userState,
+      userCity,
+      inrPrice,
+      reffId,
+      fdaFullData,
+      userId,
+    ],
+  );
+
+  return db
+    .prepare(
+      'SELECT id, fda_user_id, email, phone, full_name, fda_full_data FROM users WHERE id = ?',
+    )
+    .get(userId);
+}
 
 // Helper function to update FDA balance on remote FDA server
 
@@ -6594,6 +6692,132 @@ apiRouter.get('/admin/add-fda-balance', async (req, res) => {
 
   }
 
+});
+
+
+
+// Refresh user profile from FDA when fda_full_data is null/invalid.
+// GET /api/admin/updatefdauserdata?fdauserid=89685&password=xxxx  (password optional if plain_pass stored)
+apiRouter.get('/admin/updatefdauserdata', async (req, res) => {
+  try {
+    const fdaUserId = String(req.query.fdauserid || req.query.fda_user_id || '').trim();
+    if (!fdaUserId) {
+      return res.status(400).json({ error: 'fdauserid query parameter is required' });
+    }
+
+    const forceSync =
+      req.query.force === '1' ||
+      String(req.query.force || '').toLowerCase() === 'true';
+
+    const userRow = await db
+      .prepare(
+        `SELECT id, fda_user_id, email, phone, full_name, fda_full_data, plain_pass, plain_tpass
+         FROM users WHERE fda_user_id = ?`,
+      )
+      .get(fdaUserId);
+
+    if (!userRow) {
+      return res.status(404).json({
+        error: 'User not found',
+        fda_user_id: fdaUserId,
+      });
+    }
+
+    const needsSync = forceSync || isMissingOrInvalidFdaFullData(userRow.fda_full_data);
+    if (!needsSync) {
+      return res.json({
+        success: true,
+        synced: false,
+        skipped: true,
+        message: 'fda_full_data is already valid',
+        user: {
+          id: userRow.id,
+          fda_user_id: userRow.fda_user_id,
+          email: userRow.email,
+          phone: userRow.phone,
+          full_name: userRow.full_name,
+        },
+      });
+    }
+
+    const password =
+      req.query.password != null && String(req.query.password).trim() !== ''
+        ? String(req.query.password).trim()
+        : userRow.plain_pass != null && String(userRow.plain_pass).trim() !== ''
+          ? String(userRow.plain_pass).trim()
+          : null;
+
+    if (!password) {
+      return res.status(400).json({
+        error: 'Password required',
+        message:
+          'fda_full_data is null or invalid. Pass ?password=... or ensure user logged in once so plain_pass is stored.',
+        fda_user_id: fdaUserId,
+        user_id: userRow.id,
+      });
+    }
+
+    console.log(`[ADMIN] Syncing FDA profile for user ${userRow.id} (fda_user_id ${fdaUserId})`);
+
+    const fdaResponse = await getUserFromFDA(fdaUserId, password);
+    if (!fdaResponse.status) {
+      return res.status(401).json({
+        error: 'FDA API failed',
+        message: fdaResponse.message || 'Unable to fetch user profile from FDA',
+        fda_user_id: fdaUserId,
+      });
+    }
+
+    let fdaUserData = fdaResponse.parsed ?? null;
+    if (!fdaUserData) {
+      try {
+        fdaUserData = JSON.parse(fdaResponse.data);
+      } catch {
+        return res.status(502).json({
+          error: 'Invalid FDA response',
+          message: 'FDA returned non-JSON data',
+        });
+      }
+    }
+
+    if (isFdaLoginErrorPayload(fdaUserData) || !isValidFdaProfilePayload(fdaUserData)) {
+      return res.status(401).json({
+        error: 'Invalid FDA profile',
+        message:
+          fdaUserData?.message ||
+          'FDA response missing user profile (check user ID/password)',
+        fda_user_id: fdaUserId,
+      });
+    }
+
+    const updatedRow = await applyFdaProfileToUser(userRow.id, fdaUserData);
+    if (!updatedRow) {
+      return res.status(500).json({
+        error: 'Failed to update user profile',
+        fda_user_id: fdaUserId,
+      });
+    }
+
+    return res.json({
+      success: true,
+      synced: true,
+      message: 'User profile synced from FDA API',
+      user: {
+        id: updatedRow.id,
+        fda_user_id: updatedRow.fda_user_id,
+        email: updatedRow.email,
+        phone: updatedRow.phone,
+        full_name: updatedRow.full_name,
+        fda_full_data_updated: updatedRow.fda_full_data != null,
+      },
+    });
+  } catch (err) {
+    console.error('[ADMIN] updatefdauserdata error:', err);
+    return res.status(500).json({
+      error: 'Failed to update FDA user data',
+      details: err.message || 'Server error',
+    });
+  }
 });
 
 
