@@ -6187,8 +6187,53 @@ apiRouter.get('/admin/add-fda-balance', async (req, res) => {
     // Support both old parameter name (fdauserid) and new one (wallet_address) for backward compatibility
 
     const walletAddressParam = wallet_address || req.query.fdauserid; // fdauserid can be wallet address now
+    const expectedFdaUserId =
+      wallet_address != null && req.query.fdauserid != null
+        ? String(req.query.fdauserid).trim()
+        : null;
 
     const fda_balance = fda;
+    const requestUrl = req.originalUrl || req.url || null;
+    let walletAddress = walletAddressParam ? String(walletAddressParam).toLowerCase().trim() : null;
+    let walletInfo = null;
+
+    const writeHitHistory = async ({
+      statusCode,
+      outcome,
+      errorMessage = null,
+      previousBalance = 0,
+      newBalance = 0,
+      amountAdded = 0,
+      resolvedWalletAddress = walletAddress,
+    }) => {
+      try {
+        await db.query(
+          `INSERT INTO admin_fda_balance_history
+            (admin_user_id, target_user_id, target_fda_user_id, target_email, target_phone, requested_fda_user_id, wallet_address, amount_added, previous_balance, new_balance, outcome_status, outcome, error_message, request_url, request_ip, user_agent)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+          [
+            req.user?.id || null,
+            walletInfo?.user_id || null,
+            walletInfo?.fda_user_id != null ? String(walletInfo.fda_user_id) : null,
+            walletInfo?.email || null,
+            walletInfo?.phone || null,
+            expectedFdaUserId || null,
+            resolvedWalletAddress || null,
+            amountAdded || 0,
+            previousBalance || 0,
+            newBalance || 0,
+            statusCode,
+            outcome,
+            errorMessage,
+            requestUrl,
+            req.ip || null,
+            req.get('user-agent') || null,
+          ],
+        );
+      } catch (historyErr) {
+        console.error('[ADMIN] Failed to write admin_fda_balance_history:', historyErr.message);
+      }
+    };
 
     
 
@@ -6196,6 +6241,11 @@ apiRouter.get('/admin/add-fda-balance', async (req, res) => {
 
     if (!walletAddressParam) {
 
+      await writeHitHistory({
+        statusCode: 400,
+        outcome: 'VALIDATION_ERROR',
+        errorMessage: 'Wallet address is required (use wallet_address parameter)',
+      });
       return res.status(400).json({ error: 'Wallet address is required (use wallet_address parameter)' });
 
     }
@@ -6204,6 +6254,11 @@ apiRouter.get('/admin/add-fda-balance', async (req, res) => {
 
     if (fda_balance === undefined || fda_balance === null || fda_balance === '') {
 
+      await writeHitHistory({
+        statusCode: 400,
+        outcome: 'VALIDATION_ERROR',
+        errorMessage: 'FDA balance is required',
+      });
       return res.status(400).json({ error: 'FDA balance is required' });
 
     }
@@ -6214,6 +6269,11 @@ apiRouter.get('/admin/add-fda-balance', async (req, res) => {
 
     if (isNaN(balanceNum)) {
 
+      await writeHitHistory({
+        statusCode: 400,
+        outcome: 'VALIDATION_ERROR',
+        errorMessage: 'FDA balance must be a valid number',
+      });
       return res.status(400).json({ error: 'FDA balance must be a valid number' });
 
     }
@@ -6222,13 +6282,18 @@ apiRouter.get('/admin/add-fda-balance', async (req, res) => {
 
     if (balanceNum <= 0) {
 
+      await writeHitHistory({
+        statusCode: 400,
+        outcome: 'VALIDATION_ERROR',
+        errorMessage: 'FDA balance must be greater than 0',
+      });
       return res.status(400).json({ error: 'FDA balance must be greater than 0' });
 
     }
 
     
 
-    const walletAddress = String(walletAddressParam).toLowerCase().trim();
+    walletAddress = String(walletAddressParam).toLowerCase().trim();
 
     
 
@@ -6236,6 +6301,12 @@ apiRouter.get('/admin/add-fda-balance', async (req, res) => {
 
     if (!walletAddress.startsWith('0x') || walletAddress.length < 40) {
 
+      await writeHitHistory({
+        statusCode: 400,
+        outcome: 'VALIDATION_ERROR',
+        errorMessage: 'Invalid wallet address format',
+        resolvedWalletAddress: walletAddress,
+      });
       return res.status(400).json({ error: 'Invalid wallet address format' });
 
     }
@@ -6264,12 +6335,18 @@ apiRouter.get('/admin/add-fda-balance', async (req, res) => {
 
     
 
-    const walletInfo = walletResult.rows[0];
+    walletInfo = walletResult.rows[0];
 
     if (!walletInfo) {
 
       console.log(`[ADMIN] ❌ Wallet not registered in MC Wallet system: ${walletAddress}`);
 
+      await writeHitHistory({
+        statusCode: 404,
+        outcome: 'WALLET_NOT_FOUND',
+        errorMessage: `Wallet ${walletAddress} is not registered`,
+        resolvedWalletAddress: walletAddress,
+      });
       return res.status(404).json({ 
 
         error: 'Wallet not registered',
@@ -6293,6 +6370,52 @@ apiRouter.get('/admin/add-fda-balance', async (req, res) => {
     console.log(`  Phone: ${walletInfo.phone || 'N/A'}`);
 
     console.log(`  FDA User ID: ${walletInfo.fda_user_id || 'N/A'}`);
+
+    // Optional safety check:
+    // if caller passes both wallet_address and fdauserid, ensure wallet belongs to same FDA user id.
+    if (expectedFdaUserId) {
+      const walletFdaUserId =
+        walletInfo.fda_user_id != null ? String(walletInfo.fda_user_id).trim() : '';
+      if (walletFdaUserId === '') {
+        console.log(
+          `[ADMIN] ❌ FDA user mismatch: wallet has no FDA user id, expected ${expectedFdaUserId}`,
+        );
+        await writeHitHistory({
+          statusCode: 400,
+          outcome: 'FDA_USER_MISMATCH',
+          errorMessage: 'Wallet is not linked to an FDA user ID in database; cannot verify requested fdauserid.',
+          resolvedWalletAddress: walletAddress,
+        });
+        return res.status(400).json({
+          error: 'FDA user mismatch',
+          message:
+            'Wallet is not linked to an FDA user ID in database; cannot verify requested fdauserid.',
+          wallet_address: walletAddress,
+          expected_fda_user_id: expectedFdaUserId,
+          actual_fda_user_id: walletInfo.fda_user_id || null,
+        });
+      }
+
+      if (walletFdaUserId !== expectedFdaUserId) {
+        console.log(
+          `[ADMIN] ❌ FDA user mismatch: wallet ${walletAddress} belongs to ${walletFdaUserId}, got ${expectedFdaUserId}`,
+        );
+        await writeHitHistory({
+          statusCode: 400,
+          outcome: 'FDA_USER_MISMATCH',
+          errorMessage: `Provided fdauserid ${expectedFdaUserId} does not match wallet owner ${walletFdaUserId}`,
+          resolvedWalletAddress: walletAddress,
+        });
+        return res.status(400).json({
+          error: 'FDA user mismatch',
+          message:
+            'Provided fdauserid does not match wallet owner FDA user ID. Balance was not added.',
+          wallet_address: walletAddress,
+          expected_fda_user_id: expectedFdaUserId,
+          actual_fda_user_id: walletFdaUserId,
+        });
+      }
+    }
 
     
 
@@ -6350,6 +6473,15 @@ apiRouter.get('/admin/add-fda-balance', async (req, res) => {
 
         console.error(`[ADMIN] ❌ Failed to update balance. No rows affected.`);
 
+        await writeHitHistory({
+          statusCode: 500,
+          outcome: 'DB_UPDATE_FAILED',
+          errorMessage: 'Failed to update balance. No rows affected.',
+          previousBalance: oldBalance,
+          newBalance: oldBalance,
+          amountAdded: balanceNum,
+          resolvedWalletAddress: walletAddress,
+        });
         return res.status(500).json({ error: 'Failed to update balance. No rows affected.' });
 
       }
@@ -6379,6 +6511,15 @@ apiRouter.get('/admin/add-fda-balance', async (req, res) => {
     console.log(`[========================================]\n`);
 
     
+
+    await writeHitHistory({
+      statusCode: 200,
+      outcome: 'SUCCESS',
+      previousBalance: oldBalance,
+      newBalance,
+      amountAdded: balanceNum,
+      resolvedWalletAddress: walletAddress,
+    });
 
     res.json({ 
 
@@ -6419,6 +6560,29 @@ apiRouter.get('/admin/add-fda-balance', async (req, res) => {
     console.error('[ADMIN] ❌ Error adding FDA balance:', err);
 
     console.error('Error stack:', err.stack);
+
+    try {
+      const requestedWallet = req.query.wallet_address || req.query.fdauserid || null;
+      await db.query(
+        `INSERT INTO admin_fda_balance_history
+          (admin_user_id, requested_fda_user_id, wallet_address, amount_added, previous_balance, new_balance, outcome_status, outcome, error_message, request_url, request_ip, user_agent)
+         VALUES ($1, $2, $3, $4, 0, 0, 500, 'SERVER_ERROR', $5, $6, $7, $8)`,
+        [
+          req.user?.id || null,
+          req.query.fdauserid != null ? String(req.query.fdauserid).trim() : null,
+          requestedWallet != null ? String(requestedWallet).toLowerCase().trim() : null,
+          req.query.fda != null && req.query.fda !== '' && !Number.isNaN(parseFloat(req.query.fda))
+            ? parseFloat(req.query.fda)
+            : 0,
+          err.message || 'Unknown server error',
+          req.originalUrl || req.url || null,
+          req.ip || null,
+          req.get('user-agent') || null,
+        ],
+      );
+    } catch (historyErr) {
+      console.error('[ADMIN] Failed to write error hit history:', historyErr.message);
+    }
 
     res.status(500).json({ 
 

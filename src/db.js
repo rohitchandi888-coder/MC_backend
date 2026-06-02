@@ -602,6 +602,67 @@ export async function runMigrations() {
     `);
 
     await client.query(`
+      CREATE TABLE IF NOT EXISTS admin_fda_balance_history (
+        id SERIAL PRIMARY KEY,
+        admin_user_id INTEGER,
+        target_user_id INTEGER,
+        target_fda_user_id VARCHAR(255),
+        target_email VARCHAR(255),
+        target_phone VARCHAR(50),
+        requested_fda_user_id VARCHAR(255),
+        wallet_address VARCHAR(255) NOT NULL,
+        amount_added NUMERIC(30, 18) NOT NULL,
+        previous_balance NUMERIC(30, 18) NOT NULL,
+        new_balance NUMERIC(30, 18) NOT NULL,
+        outcome_status INTEGER NOT NULL DEFAULT 200,
+        outcome VARCHAR(50) NOT NULL DEFAULT 'SUCCESS',
+        error_message TEXT,
+        request_url TEXT,
+        request_ip VARCHAR(100),
+        user_agent TEXT,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (admin_user_id) REFERENCES users(id) ON DELETE SET NULL,
+        FOREIGN KEY (target_user_id) REFERENCES users(id) ON DELETE SET NULL
+      );
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_admin_fda_balance_history_wallet_created
+      ON admin_fda_balance_history (wallet_address, created_at DESC);
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_admin_fda_balance_history_target_user
+      ON admin_fda_balance_history (target_user_id, created_at DESC);
+    `);
+    await client.query(`
+      ALTER TABLE admin_fda_balance_history
+      ADD COLUMN IF NOT EXISTS requested_fda_user_id VARCHAR(255);
+    `);
+    await client.query(`
+      ALTER TABLE admin_fda_balance_history
+      ADD COLUMN IF NOT EXISTS target_email VARCHAR(255);
+    `);
+    await client.query(`
+      ALTER TABLE admin_fda_balance_history
+      ADD COLUMN IF NOT EXISTS target_phone VARCHAR(50);
+    `);
+    await client.query(`
+      ALTER TABLE admin_fda_balance_history
+      ADD COLUMN IF NOT EXISTS outcome_status INTEGER NOT NULL DEFAULT 200;
+    `);
+    await client.query(`
+      ALTER TABLE admin_fda_balance_history
+      ADD COLUMN IF NOT EXISTS outcome VARCHAR(50) NOT NULL DEFAULT 'SUCCESS';
+    `);
+    await client.query(`
+      ALTER TABLE admin_fda_balance_history
+      ADD COLUMN IF NOT EXISTS error_message TEXT;
+    `);
+    await client.query(`
+      ALTER TABLE admin_fda_balance_history
+      ADD COLUMN IF NOT EXISTS request_url TEXT;
+    `);
+
+    await client.query(`
       ALTER TABLE internal_transfers ADD COLUMN IF NOT EXISTS from_wallet_address VARCHAR(255);
     `);
     await client.query(`
