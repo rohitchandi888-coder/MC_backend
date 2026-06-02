@@ -2110,10 +2110,6 @@ apiRouter.put('/auth/change-password', authMiddleware, async (req, res) => {
 
 apiRouter.get('/offers', authMiddleware, async (req, res) => {
   try {
-  const requestedLimit = Number.parseInt(String(req.query?.limit ?? '120'), 10);
-  const limit = Number.isFinite(requestedLimit)
-    ? Math.min(300, Math.max(20, requestedLimit))
-    : 120;
   const rows = await db
 
     .prepare(
@@ -2124,8 +2120,7 @@ apiRouter.get('/offers', authMiddleware, async (req, res) => {
        FROM offers o
        LEFT JOIN users u ON u.id = o.maker_id
        WHERE o.status = 'OPEN'
-       ORDER BY o.created_at DESC
-       LIMIT ${limit}`,
+       ORDER BY o.created_at DESC`,
 
     )
 
@@ -9198,17 +9193,7 @@ apiRouter.get('/admin/disputes', authMiddleware, adminMiddleware, async (_req, r
 
               t.buyer_id, t.seller_id, t.payment_screenshot,
 
-              COALESCE(
-                NULLIF(TRIM(BOTH FROM COALESCE(buyer.email, '')), ''),
-                NULLIF(TRIM(BOTH FROM COALESCE(buyer.fda_full_data #>> '{data,loginId}', '')), ''),
-                NULLIF(TRIM(BOTH FROM COALESCE(buyer.fda_full_data->>'loginId', '')), '')
-              ) as buyer_email,
-              COALESCE(
-                NULLIF(TRIM(BOTH FROM COALESCE(buyer.phone, '')), ''),
-                NULLIF(TRIM(BOTH FROM COALESCE(buyer.fda_full_data #>> '{data,userMobiTel}', '')), ''),
-                NULLIF(TRIM(BOTH FROM COALESCE(buyer.fda_full_data->>'userMobiTel', '')), '')
-              ) as buyer_phone,
-              buyer.full_name as buyer_name,
+              buyer.email as buyer_email, buyer.phone as buyer_phone, buyer.full_name as buyer_name,
 
               CAST(COALESCE(
                 NULLIF(TRIM(BOTH FROM COALESCE(buyer.fda_user_id::text, '')), ''),
@@ -9216,17 +9201,7 @@ apiRouter.get('/admin/disputes', authMiddleware, adminMiddleware, async (_req, r
                 NULLIF(TRIM(BOTH FROM COALESCE(buyer.fda_full_data->>'userId', '')), '')
               ) AS TEXT) AS buyer_fda_user_id,
 
-              COALESCE(
-                NULLIF(TRIM(BOTH FROM COALESCE(seller.email, '')), ''),
-                NULLIF(TRIM(BOTH FROM COALESCE(seller.fda_full_data #>> '{data,loginId}', '')), ''),
-                NULLIF(TRIM(BOTH FROM COALESCE(seller.fda_full_data->>'loginId', '')), '')
-              ) as seller_email,
-              COALESCE(
-                NULLIF(TRIM(BOTH FROM COALESCE(seller.phone, '')), ''),
-                NULLIF(TRIM(BOTH FROM COALESCE(seller.fda_full_data #>> '{data,userMobiTel}', '')), ''),
-                NULLIF(TRIM(BOTH FROM COALESCE(seller.fda_full_data->>'userMobiTel', '')), '')
-              ) as seller_phone,
-              seller.full_name as seller_name,
+              seller.email as seller_email, seller.phone as seller_phone, seller.full_name as seller_name,
 
               CAST(COALESCE(
                 NULLIF(TRIM(BOTH FROM COALESCE(seller.fda_user_id::text, '')), ''),
@@ -9234,17 +9209,7 @@ apiRouter.get('/admin/disputes', authMiddleware, adminMiddleware, async (_req, r
                 NULLIF(TRIM(BOTH FROM COALESCE(seller.fda_full_data->>'userId', '')), '')
               ) AS TEXT) AS seller_fda_user_id,
 
-              COALESCE(
-                NULLIF(TRIM(BOTH FROM COALESCE(raised_by.email, '')), ''),
-                NULLIF(TRIM(BOTH FROM COALESCE(raised_by.fda_full_data #>> '{data,loginId}', '')), ''),
-                NULLIF(TRIM(BOTH FROM COALESCE(raised_by.fda_full_data->>'loginId', '')), '')
-              ) as raised_by_email,
-              COALESCE(
-                NULLIF(TRIM(BOTH FROM COALESCE(raised_by.phone, '')), ''),
-                NULLIF(TRIM(BOTH FROM COALESCE(raised_by.fda_full_data #>> '{data,userMobiTel}', '')), ''),
-                NULLIF(TRIM(BOTH FROM COALESCE(raised_by.fda_full_data->>'userMobiTel', '')), '')
-              ) as raised_by_phone,
-              raised_by.full_name as raised_by_name,
+              raised_by.email as raised_by_email, raised_by.phone as raised_by_phone, raised_by.full_name as raised_by_name,
 
               CAST(COALESCE(
                 NULLIF(TRIM(BOTH FROM COALESCE(raised_by.fda_user_id::text, '')), ''),
