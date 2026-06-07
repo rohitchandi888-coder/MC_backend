@@ -1083,13 +1083,23 @@ apiRouter.post('/auth/login', async (req, res) => {
 
     
 
-    // Try email/phone first
+    const loginId = String(username).trim();
+
+    // Try email/phone first (case-insensitive email, trimmed phone)
 
     let userRow = await db
 
-      .prepare('SELECT id, fda_user_id, email, phone, password_hash, is_admin FROM users WHERE email = ? OR phone = ?')
+      .prepare(
 
-      .get(username, username);
+        `SELECT id, fda_user_id, email, phone, password_hash, is_admin FROM users
+
+         WHERE (email IS NOT NULL AND LOWER(TRIM(email)) = LOWER(?))
+
+            OR (phone IS NOT NULL AND TRIM(phone) = ?)`
+
+      )
+
+      .get(loginId, loginId);
 
     
 
@@ -1103,7 +1113,7 @@ apiRouter.post('/auth/login', async (req, res) => {
 
         .prepare('SELECT id, fda_user_id, email, phone, password_hash, is_admin FROM users WHERE fda_user_id = ?')
 
-        .get(String(username));
+        .get(loginId);
 
     }
 
@@ -2573,39 +2583,11 @@ console.log("this is requestbody", req.body);
 
       const locked = lockedResult.rows[0] ? parseFloat(lockedResult.rows[0].locked) : 0;
 
-      
-
-      // Calculate locked amount in holding periods (not expired yet)
-
-      const holdingResult = await db.query(`
-
-        SELECT COALESCE(SUM(amount), 0) as holding_locked
-
-        FROM fda_holdings
-
-        WHERE user_id = $1 AND expires_at > CURRENT_TIMESTAMP
-
-      `, [req.user.id]);
-
-      const holdingLocked = holdingResult.rows[0] ? parseFloat(holdingResult.rows[0].holding_locked) : 0;
-
-      
-
-      const available = parseFloat(balanceRow.fda_balance) - locked;
-
-      
-
-      // Get holding FDA amount setting
-
-      const holdingSettingResult = await db.query('SELECT value FROM settings WHERE key = $1', ['holding_fda_amount']);
-
-      const holdingAmount = holdingSettingResult.rows[0] ? parseFloat(holdingSettingResult.rows[0].value) : 0;
-
-      
-
-      const usableBalance = available - holdingAmount - holdingLocked;
-
-      
+      // Wallet-scoped: holds on other wallets must not block sell on this wallet
+      const holdSnap = await getHoldingUsableSnapshot(req.user.id, walletAddress);
+      const usableBalance = holdSnap.usableBalance;
+      const holdingLocked = holdSnap.activeHoldingLocked;
+      const holdingAmount = holdSnap.holdingReserveAmount;
 
       if (parseFloat(balanceRow.fda_balance) < amountNum) {
 
@@ -2617,11 +2599,11 @@ console.log("this is requestbody", req.body);
 
       if (usableBalance < amountNum) {
 
-        const holdingInfo = holdingLocked > 0 ? ` ${holdingLocked.toFixed(18)} FDA locked in holding periods,` : '';
+        const holdingInfo = holdingLocked > 0 ? ` ${holdingLocked.toFixed(18)} FDA locked in holding periods on this wallet,` : '';
 
         return res.status(400).json({ 
 
-          error: `Cannot create offer. You must maintain a minimum holding balance of ${holdingAmount} FDA.${holdingInfo} Available: ${available.toFixed(18)} FDA, Usable: ${usableBalance.toFixed(18)} FDA, Required: ${amountNum} FDA.` 
+          error: `Cannot create offer. You must maintain a minimum holding balance of ${holdingAmount} FDA.${holdingInfo} Usable for sell on this wallet: ${usableBalance.toFixed(18)} FDA, Required: ${amountNum} FDA.` 
 
         });
 
@@ -6044,39 +6026,12 @@ apiRouter.get('/internal/balance', authMiddleware, async (req, res) => {
 
     const locked = lockedResult.rows[0] ? parseFloat(lockedResult.rows[0].locked) : 0;
 
-    
-
-    // Calculate locked amount in holding periods (not expired yet)
-
-    const holdingResult = await db.query(`
-
-      SELECT COALESCE(SUM(amount), 0) as holding_locked
-
-      FROM fda_holdings
-
-      WHERE user_id = $1 AND expires_at > CURRENT_TIMESTAMP
-
-    `, [userId]);
-
-    const holdingLocked = holdingResult.rows[0] ? parseFloat(holdingResult.rows[0].holding_locked) : 0;
-
-    
-
-    // Since balance is already deducted when creating offers, available = totalBalance
-
-    // The locked amount is already included in the deduction
-
-    const available = totalBalance;
-
-    
-
-    // Get holding FDA amount setting
-
-    const holdingSettingResult = await db.query('SELECT value FROM settings WHERE key = $1', ['holding_fda_amount']);
-
-    const holdingAmount = holdingSettingResult.rows[0] ? parseFloat(holdingSettingResult.rows[0].value) : 0;
-
-    const usable = Math.max(0, available - holdingAmount - holdingLocked);
+    // Wallet-scoped usable (matches Home "Available FDA" — other wallets' holds do not apply)
+    const holdSnap = await getHoldingUsableSnapshot(userId, walletAddress);
+    const holdingLocked = holdSnap.activeHoldingLocked;
+    const holdingAmount = holdSnap.holdingReserveAmount;
+    const usable = holdSnap.usableBalance;
+    const available = usable;
 
     
 
@@ -6120,7 +6075,8 @@ apiRouter.get('/internal/balance', authMiddleware, async (req, res) => {
       total: totalBalance + locked, // Total original balance
 
       holding: holdingAmount,
-      usable: Math.max(0, totalBalance - holdingAmount - holdingLocked), // Usable after holding requirement and holding periods
+      usable,
+      totalInternalOnWallet: holdSnap.totalBalance,
       pendingReward: Number(pendingReward.toFixed(18)),
       projectedTotalAfterClaim: Number((totalBalance + locked + pendingReward).toFixed(18))
 
@@ -7235,17 +7191,10 @@ apiRouter.post('/internal/transfer', authMiddleware, async (req, res) => {
 
     const locked = lockedResult.rows[0] ? parseFloat(lockedResult.rows[0].locked) : 0;
 
-    const available = senderBalance - locked;
-
-    
-
-    // Get holding FDA amount setting
-
-    const holdingSettingResult = await db.query('SELECT value FROM settings WHERE key = $1', ['holding_fda_amount']);
-
-    const holdingAmount = holdingSettingResult.rows[0] ? parseFloat(holdingSettingResult.rows[0].value) : 0;
-
-    const usableBalance = Math.max(0, available - holdingAmount);
+    const holdSnap = await getHoldingUsableSnapshot(req.user.id, fromWalletAddress);
+    const usableBalance = holdSnap.usableBalance;
+    const holdingAmount = holdSnap.holdingReserveAmount;
+    const available = holdSnap.totalBalance;
 
     
 
@@ -10370,13 +10319,13 @@ async function initializeAdminUser() {
 
 
 
-    // Check if admin user exists
+    // Check if admin user exists (email or configured admin phone)
 
     let adminUser = await db
 
-      .prepare('SELECT id, email, is_admin FROM users WHERE email = ?')
+      .prepare('SELECT id, email, phone, is_admin FROM users WHERE email = ? OR phone = ?')
 
-      .get(adminEmail);
+      .get(adminEmail, adminPhone);
 
 
 
